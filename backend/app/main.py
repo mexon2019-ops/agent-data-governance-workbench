@@ -1084,7 +1084,7 @@ def create_standard_version(
     row = db.get(DataStandard, standard_id)
     if not row:
         raise HTTPException(404, "数据标准不存在")
-    next_version = (db.scalar(select(func.max(DataStandardVersion.version_number).where(
+    next_version = (db.scalar(select(func.max(DataStandardVersion.version_number)).where(
         DataStandardVersion.standard_id == standard_id)) or 0) + 1
     version = DataStandardVersion(standard_id=standard_id, version_number=next_version,
                                   status="草稿", **payload.model_dump())
