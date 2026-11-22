@@ -319,12 +319,21 @@ async def audit_mutating_requests(request: Request, call_next):
         status_code = 500
         raise
     finally:
-        # Authentication is not yet wired in this sprint. Never trust a caller-
-        # supplied identity header; use an explicit anonymous placeholder.
+        # Resolve the actor only from a cryptographically verified bearer token.
+        # Never trust caller-supplied identity headers.
+        actor = "anonymous"
+        authorization = request.headers.get("authorization", "")
+        if authorization.lower().startswith("bearer "):
+            try:
+                claims = jwt.decode(authorization.split(" ", 1)[1], get_jwt_secret(),
+                                    algorithms=[JWT_ALGORITHM])
+                actor = str(claims.get("sub") or "anonymous")
+            except (InvalidTokenError, HTTPException, ValueError, TypeError):
+                actor = "anonymous"
         with SessionLocal() as audit_db:
             audit_db.add(AuditLog(
                 request_id=request_id,
-                actor="anonymous",
+                actor=actor,
                 action=request.method,
                 resource=request.url.path[:255],
                 http_method=request.method,
