@@ -66,7 +66,7 @@ V0.3 先交付轻量元数据采集闭环；OpenMetadata 保留为下一阶段�
 
 ### 启动
 
-先复制并编辑环境变量文件，至少修改 PostgreSQL、MySQL root 和只读账号密码：
+先复制并编辑环境变量文件，必须修改 PostgreSQL、MySQL root 和只读账号密码（不要使用示例值）：
 
 ```bash
 cp .env.example .env
@@ -75,7 +75,7 @@ cp .env.example .env
 启动测试 MySQL：
 
 ```bash
-docker compose --profile mysql-test up -d mysql-test
+docker compose --profile mysql-test up -d
 docker compose ps
 docker compose logs -f mysql-test
 ```
@@ -91,7 +91,7 @@ MySQL 仅绑定宿主机回环地址 `127.0.0.1:3307`，不会默认暴露到局
 | 用户 | metadata_reader |
 | 密码环境变量名 | MYSQL_TEST_READER_PASSWORD |
 
-在工作台“数据源管理”创建数据源，密码环境变量名填 `MYSQL_TEST_READER_PASSWORD`，然后测试连接并采集元数据。
+后端启动时会自动、幂等地添加名为“ MySQL 测试数据库（mes_test）”的数据源，连接配置为 `mysql-test:3306`，密码环境变量名为 `MYSQL_TEST_READER_PASSWORD`。打开工作台“数据源管理”，找到该数据源，点击测试连接，再采集元数据；无需手工新增数据源。
 
 如果从宿主机上的数据库客户端连接，使用 `127.0.0.1:3307`，用户名 `metadata_reader` 和 `.env` 中配置的只读密码。
 

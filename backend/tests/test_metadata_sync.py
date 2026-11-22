@@ -130,3 +130,34 @@ def test_mysql_sync_is_scoped_to_configured_database(monkeypatch):
         assert inspector.seen_schemas == ["mes_quality"]
         saved = db.scalar(select(main.MetadataTable).where(main.MetadataTable.source_id == source.id))
         assert saved.schema_name == "mes_quality"
+
+
+def test_mysql_test_datasource_auto_registration_is_opt_in_and_idempotent(monkeypatch):
+    main.Base.metadata.create_all(main.engine)
+    name = "MySQL 测试数据库（mes_test）"
+    monkeypatch.setenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "true")
+    monkeypatch.setenv("MYSQL_TEST_HOST", "mysql-test")
+    with main.SessionLocal() as db:
+        old = db.scalar(select(main.DataSource).where(main.DataSource.name == name))
+        if old:
+            db.delete(old)
+            db.commit()
+
+        first = main.ensure_mysql_test_datasource(db)
+        second = main.ensure_mysql_test_datasource(db)
+
+        assert first is not None
+        assert first.id == second.id
+        assert first.db_type == "mysql"
+        assert first.host == "mysql-test"
+        assert first.port == 3306
+        assert first.database == "mes_test"
+        assert first.username == "metadata_reader"
+        assert first.password_env_key == "MYSQL_TEST_READER_PASSWORD"
+        assert db.scalar(select(main.DataSource).where(main.DataSource.name == name)) is not None
+
+
+def test_mysql_test_datasource_auto_registration_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", raising=False)
+    with main.SessionLocal() as db:
+        assert main.ensure_mysql_test_datasource(db) is None
