@@ -81,6 +81,8 @@ def test_standard_version_publish_and_field_mapping_lifecycle():
         detail = main.get_data_standard(created["id"], db=db)
         assert len(detail["mappings"]) == 1
         assert detail["mappings"][0]["metadata_column_id"] == column.id
+        metadata_detail = main.get_metadata_table(table.id, db=db)
+        assert metadata_detail["columns"][0]["standard_mappings"][0]["standard_code"] == code
 
         db.delete(db.get(main.DataStandard, created["id"]))
         db.delete(source)

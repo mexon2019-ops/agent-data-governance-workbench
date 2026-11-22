@@ -805,14 +805,29 @@ def get_metadata_table(table_id: int, db: Session = Depends(db_session)):
     if not row:
         raise HTTPException(404, "元数据表不存在")
     source = db.get(DataSource, row.source_id)
+    columns = []
+    for column in row.columns:
+        mappings = db.execute(
+            select(DataStandardMapping, DataStandardVersion, DataStandard)
+            .join(DataStandardVersion, DataStandardMapping.version_id == DataStandardVersion.id)
+            .join(DataStandard, DataStandardVersion.standard_id == DataStandard.id)
+            .where(DataStandardMapping.metadata_column_id == column.id)
+        ).all()
+        columns.append({
+            "id": column.id, "column_name": column.column_name, "data_type": column.data_type,
+            "nullable": column.nullable, "default_value": column.default_value,
+            "ordinal_position": column.ordinal_position, "description": column.description,
+            "is_primary_key": column.is_primary_key, "is_foreign_key": column.is_foreign_key,
+            "standard_mappings": [{
+                "mapping_id": mapping.id, "standard_id": standard.id,
+                "standard_code": standard.standard_code, "standard_name": standard.name,
+                "version_id": version.id, "version_number": version.version_number,
+                "mapping_status": mapping.mapping_status, "note": mapping.note,
+            } for mapping, version, standard in mappings],
+        })
     return {
         **table_public(row, source.name if source else ""),
-        "columns": [{
-            "id": c.id, "column_name": c.column_name, "data_type": c.data_type,
-            "nullable": c.nullable, "default_value": c.default_value,
-            "ordinal_position": c.ordinal_position, "description": c.description,
-            "is_primary_key": c.is_primary_key, "is_foreign_key": c.is_foreign_key
-        } for c in row.columns]
+        "columns": columns,
     }
 
 
