@@ -161,3 +161,28 @@ def test_mysql_test_datasource_auto_registration_is_disabled_by_default(monkeypa
     monkeypatch.delenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", raising=False)
     with main.SessionLocal() as db:
         assert main.ensure_mysql_test_datasource(db) is None
+
+
+def test_audit_log_model_persists_mutation_metadata_without_payload():
+    main.Base.metadata.create_all(main.engine)
+    with main.SessionLocal() as db:
+        row = main.AuditLog(
+            request_id="00000000-0000-4000-8000-000000000001",
+            actor="anonymous",
+            action="POST",
+            resource="/api/v1/datasources",
+            http_method="POST",
+            path="/api/v1/datasources",
+            status_code=201,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        saved = db.get(main.AuditLog, row.id)
+        assert saved is not None
+        assert saved.actor == "anonymous"
+        assert saved.action == "POST"
+        assert saved.path == "/api/v1/datasources"
+        assert saved.status_code == 201
+        assert not hasattr(saved, "request_body")
+        assert not hasattr(saved, "password")
