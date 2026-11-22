@@ -3,7 +3,7 @@ import { Activity, Bot, Boxes, CheckCircle2, ChevronRight, CircleHelp, Database,
 
 type Page = 'dashboard'|'sources'|'assets'|'catalog'|'standards'|'quality'|'tasks'|'agent';
 type Source = {id:number;name:string;db_type:string;host:string;port:number;database:string;username:string;password_env_key:string;description:string;status:string};
-type RecordRow = {id:number;category:string;name:string;description:string;status:string;owner:string};
+type RecordRow = {id:number;category:string;name:string;description:string;status:string;owner:string;created_at?:string};
 const API='/api/v1';
 const nav:{id:Page;label:string;icon:any;group:string}[]=[
  {id:'dashboard',label:'治理总览',icon:LayoutDashboard,group:'工作空间'},
