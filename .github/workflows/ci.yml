@@ -23,7 +23,7 @@ jobs:
       - name: Run metadata ingestion unit tests
         run: |
           cd backend
-          DATABASE_URL=sqlite:////tmp/metadata-unit-ci.db pytest -q
+          DATABASE_URL=sqlite:////tmp/metadata-unit-ci.db PYTHONPATH=. pytest -q
       - name: Start backend
         run: |
           cd backend
