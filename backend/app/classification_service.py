@@ -1,6 +1,6 @@
 """Rule-based metadata field classification suggestions.
 
-Suggestions are based only on column names and declared data types.
+Suggestions are based on column names only; source data rows are never sampled.
 No source database rows are read or sampled.
 """
 import re
@@ -21,7 +21,7 @@ SENSITIVE_PATTERNS = [
 ]
 
 
-def suggest_field_classification(column_name: str, data_type: str = "") -> dict:
+def suggest_field_classification(column_name: str, _data_type: str = "") -> dict:
     name = (column_name or "").strip().lower()
     for pattern, reason in HIGH_PATTERNS:
         if re.search(pattern, name, flags=re.IGNORECASE):
