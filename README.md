@@ -69,6 +69,10 @@ API：
 ## OpenMetadata 集成策略
 V0.3 先交付轻量元数据采集闭环；OpenMetadata 保留为下一阶段的增强治理引擎，用于扩展统一元数据服务、血缘、治理工作流和更多连接器。官方连接器支持 PostgreSQL、MySQL、Oracle、SQL Server。生产部署需单独评估数据库、搜索引擎和 Ingestion 服务的资源与运维成本，不直接把 Quickstart 组件未经评估地并入企业生产环境。
 
+## Sprint 9：元数据结构血缘
+
+元数据采集会读取数据库外键约束并建立字段级结构关联，工作台新增“数据血缘”只读页面。当前仅覆盖数据库声明的外键关系，不代表 ETL、API、FineReport 报表等完整数据流向。详见 [Sprint 9 元数据结构血缘](docs/SPRINT-9-METADATA-LINEAGE.md)。
+
 ## Sprint 7：字段级分类分级
 
 元数据字段详情支持敏感级别人工确认，提供基于字段名称的规则建议，并记录分类依据、确认人和时间。建议规则不读取源数据库业务数据行；Agent 仅接收未分级字段数、敏感字段数等聚合统计，不接收字段名称或明细。详见 [Sprint 7 字段分类分级](docs/SPRINT-7-FIELD-CLASSIFICATION.md)。

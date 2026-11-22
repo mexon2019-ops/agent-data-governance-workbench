@@ -138,6 +138,23 @@ class MetadataColumn(Base):
     table: Mapped[MetadataTable] = relationship(back_populates="columns")
 
 
+class MetadataLineage(Base):
+    __tablename__ = "metadata_lineage"
+    __table_args__ = (UniqueConstraint(
+        "source_column_id", "target_schema_name", "target_table_name", "target_column_name",
+        name="uq_metadata_lineage_edge",
+    ),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_table_id: Mapped[int] = mapped_column(ForeignKey("metadata_tables.id", ondelete="CASCADE"), index=True)
+    source_column_id: Mapped[int] = mapped_column(ForeignKey("metadata_columns.id", ondelete="CASCADE"), index=True)
+    target_schema_name: Mapped[str] = mapped_column(String(180), default="")
+    target_table_name: Mapped[str] = mapped_column(String(180))
+    target_column_name: Mapped[str] = mapped_column(String(180))
+    relation_type: Mapped[str] = mapped_column(String(30), default="FOREIGN_KEY")
+    discovery_method: Mapped[str] = mapped_column(String(40), default="DATABASE_CONSTRAINT")
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class MetadataSyncRun(Base):
     __tablename__ = "metadata_sync_runs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -881,6 +898,44 @@ def classify_metadata_column(
     }
 
 
+@app.get("/api/v1/metadata/lineage")
+def list_metadata_lineage(
+    source_id: int | None = None,
+    table_id: int | None = None,
+    db: Session = Depends(db_session),
+):
+    stmt = (
+        select(MetadataLineage, MetadataTable, MetadataColumn, DataSource.name)
+        .join(MetadataTable, MetadataLineage.source_table_id == MetadataTable.id)
+        .join(MetadataColumn, MetadataLineage.source_column_id == MetadataColumn.id)
+        .join(DataSource, MetadataTable.source_id == DataSource.id)
+    )
+    if source_id is not None:
+        stmt = stmt.where(MetadataTable.source_id == source_id)
+    if table_id is not None:
+        stmt = stmt.where(MetadataTable.id == table_id)
+    rows = db.execute(stmt.order_by(
+        DataSource.name, MetadataTable.schema_name, MetadataTable.table_name,
+        MetadataColumn.column_name,
+    )).all()
+    return [{
+        "id": edge.id,
+        "source_table_id": table.id,
+        "source_column_id": column.id,
+        "source_id": table.source_id,
+        "source_name": source_name,
+        "source_schema": table.schema_name,
+        "source_table": table.table_name,
+        "source_column": column.column_name,
+        "target_schema": edge.target_schema_name,
+        "target_table": edge.target_table_name,
+        "target_column": edge.target_column_name,
+        "relation_type": edge.relation_type,
+        "discovery_method": edge.discovery_method,
+        "discovered_at": edge.discovered_at,
+    } for edge, table, column, source_name in rows]
+
+
 @app.get("/api/v1/datasources/{source_id}/sync-runs")
 def list_sync_runs(source_id: int, db: Session = Depends(db_session)):
     if not db.get(DataSource, source_id):
@@ -937,10 +992,20 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 except Exception:
                     pk_cols = set()
                 try:
-                    fk_cols = {col for fk in inspector.get_foreign_keys(table_name, schema=schema)
-                               for col in (fk.get("constrained_columns") or [])}
+                    foreign_keys = inspector.get_foreign_keys(table_name, schema=schema)
                 except Exception:
-                    fk_cols = set()
+                    foreign_keys = []
+                fk_relations = []
+                for fk in foreign_keys:
+                    source_columns = fk.get("constrained_columns") or []
+                    target_columns = fk.get("referred_columns") or []
+                    target_table = str(fk.get("referred_table") or "")
+                    target_schema = str(fk.get("referred_schema") or schema_name)
+                    for source_column, target_column in zip(source_columns, target_columns):
+                        fk_relations.append((
+                            str(source_column), target_schema, target_table, str(target_column)
+                        ))
+                fk_cols = {item[0] for item in fk_relations}
                 try:
                     comment = (inspector.get_table_comment(table_name, schema=schema) or {}).get("text") or ""
                 except Exception:
@@ -959,6 +1024,10 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 existing.synced_at = datetime.utcnow()
                 # Upsert columns by physical name so metadata IDs remain stable across
                 # repeatable syncs; standards/quality mappings reference these IDs.
+                db.execute(delete(MetadataLineage).where(
+                    MetadataLineage.source_table_id == existing.id,
+                    MetadataLineage.discovery_method == "DATABASE_CONSTRAINT",
+                ))
                 old_columns = {item.column_name: item for item in existing.columns}
                 seen_columns: set[str] = set()
                 for index, col in enumerate(columns, start=1):
@@ -981,11 +1050,30 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 for old_name, old_column in old_columns.items():
                     if old_name not in seen_columns:
                         db.delete(old_column)
+                db.flush()
+                for source_column_name, target_schema, target_table, target_column in fk_relations:
+                    source_column = db.scalar(select(MetadataColumn).where(
+                        MetadataColumn.table_id == existing.id,
+                        MetadataColumn.column_name == source_column_name,
+                    ))
+                    if source_column and target_table and target_column:
+                        db.add(MetadataLineage(
+                            source_table_id=existing.id,
+                            source_column_id=source_column.id,
+                            target_schema_name=target_schema,
+                            target_table_name=target_table,
+                            target_column_name=target_column,
+                            relation_type="FOREIGN_KEY",
+                            discovery_method="DATABASE_CONSTRAINT",
+                        ))
                 table_count += 1
                 column_count += len(columns)
         stale = db.scalars(select(MetadataTable).where(MetadataTable.source_id == source_id)).all()
         for old in stale:
             if (old.schema_name, old.table_name) not in discovered:
+                db.execute(delete(MetadataLineage).where(
+                    MetadataLineage.source_table_id == old.id
+                ))
                 db.delete(old)
         run.status = "成功"
         run.table_count = table_count
