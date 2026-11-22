@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install backend dependencies
-        run: pip install fastapi==0.115.12 uvicorn==0.34.2 SQLAlchemy==2.0.40 alembic==1.15.2 pytest
+        run: pip install -r backend/requirements.txt pytest
       - name: Run metadata ingestion unit tests
         run: |
           cd backend
