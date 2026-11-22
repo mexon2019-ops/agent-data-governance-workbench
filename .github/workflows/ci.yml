@@ -60,6 +60,7 @@ jobs:
             await page.goto('http://127.0.0.1:5173',{waitUntil:'networkidle'});
             const login=await page.request.post('http://127.0.0.1:8000/api/v1/auth/login',{data:{username:'admin',password:process.env.CI_ADMIN_PASSWORD}});
             const loginData=await login.json();
+            const apiHeaders={Authorization:'Bearer '+loginData.access_token};
             if(login.status()!==200) throw new Error('CI login failed');
             await page.addInitScript(token=>sessionStorage.setItem('dg_token',token),loginData.access_token);
             await page.reload({waitUntil:'networkidle'});
