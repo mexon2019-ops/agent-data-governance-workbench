@@ -165,6 +165,58 @@ class DataAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class DataStandard(Base):
+    __tablename__ = "data_standards"
+    __table_args__ = (UniqueConstraint("standard_code", name="uq_data_standard_code"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    standard_code: Mapped[str] = mapped_column(String(80), index=True)
+    name: Mapped[str] = mapped_column(String(180), index=True)
+    business_domain: Mapped[str] = mapped_column(String(80), default="", index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    owner: Mapped[str] = mapped_column(String(100), default="")
+    status: Mapped[str] = mapped_column(String(30), default="草稿")
+    current_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    versions: Mapped[list["DataStandardVersion"]] = relationship(
+        back_populates="standard", cascade="all, delete-orphan", order_by="DataStandardVersion.version_number"
+    )
+
+
+class DataStandardVersion(Base):
+    __tablename__ = "data_standard_versions"
+    __table_args__ = (UniqueConstraint("standard_id", "version_number", name="uq_standard_version"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    standard_id: Mapped[int] = mapped_column(ForeignKey("data_standards.id", ondelete="CASCADE"), index=True)
+    version_number: Mapped[int] = mapped_column(Integer)
+    definition: Mapped[str] = mapped_column(Text, default="")
+    data_type: Mapped[str] = mapped_column(String(80), default="")
+    max_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    required: Mapped[bool] = mapped_column(Boolean, default=False)
+    format_rule: Mapped[str] = mapped_column(String(500), default="")
+    value_range: Mapped[str] = mapped_column(String(500), default="")
+    example: Mapped[str] = mapped_column(String(500), default="")
+    status: Mapped[str] = mapped_column(String(30), default="草稿")
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    standard: Mapped[DataStandard] = relationship(back_populates="versions")
+    mappings: Mapped[list["DataStandardMapping"]] = relationship(
+        back_populates="version", cascade="all, delete-orphan"
+    )
+
+
+class DataStandardMapping(Base):
+    __tablename__ = "data_standard_mappings"
+    __table_args__ = (UniqueConstraint("version_id", "metadata_column_id", name="uq_standard_column_mapping"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version_id: Mapped[int] = mapped_column(ForeignKey("data_standard_versions.id", ondelete="CASCADE"), index=True)
+    metadata_column_id: Mapped[int] = mapped_column(ForeignKey("metadata_columns.id", ondelete="CASCADE"), index=True)
+    mapping_status: Mapped[str] = mapped_column(String(30), default="待核验")
+    note: Mapped[str] = mapped_column(Text, default="")
+    mapped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    version: Mapped[DataStandardVersion] = relationship(back_populates="mappings")
+
 
 class LoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=80)
@@ -208,6 +260,37 @@ class DataAssetIn(BaseModel):
     sensitivity_level: str = Field(default="未分级", pattern="^(未分级|公开|内部|敏感|高度敏感)$")
     lifecycle_status: str = Field(default="待确认", pattern="^(待确认|建设中|已发布|已下线)$")
     tags: list[str] = Field(default_factory=list, max_length=30)
+
+class DataStandardIn(BaseModel):
+    standard_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=1, max_length=180)
+    business_domain: str = Field(default="", max_length=80)
+    description: str = Field(default="", max_length=4000)
+    owner_department: str = Field(default="", max_length=120)
+    owner: str = Field(default="", max_length=100)
+    definition: str = Field(default="", max_length=4000)
+    data_type: str = Field(default="", max_length=80)
+    max_length: int | None = Field(default=None, ge=1, le=100000)
+    required: bool = False
+    format_rule: str = Field(default="", max_length=500)
+    value_range: str = Field(default="", max_length=500)
+    example: str = Field(default="", max_length=500)
+
+
+class DataStandardVersionIn(BaseModel):
+    definition: str = Field(default="", max_length=4000)
+    data_type: str = Field(default="", max_length=80)
+    max_length: int | None = Field(default=None, ge=1, le=100000)
+    required: bool = False
+    format_rule: str = Field(default="", max_length=500)
+    value_range: str = Field(default="", max_length=500)
+    example: str = Field(default="", max_length=500)
+
+
+class DataStandardMappingIn(BaseModel):
+    metadata_column_id: int
+    mapping_status: str = Field(default="待核验", pattern="^(待核验|已落标|不符合)$")
+    note: str = Field(default="", max_length=2000)
 
 
 def db_session():
@@ -470,7 +553,9 @@ def health():
 @app.get("/api/v1/dashboard")
 def dashboard(db: Session = Depends(db_session)):
     counts = {c: db.scalar(select(func.count()).select_from(Record).where(Record.category == c)) or 0
-              for c in ["asset", "standard", "quality", "task"]}
+              for c in ["quality", "task"]}
+    counts["asset"] = db.scalar(select(func.count()).select_from(DataAsset)) or 0
+    counts["standard"] = db.scalar(select(func.count()).select_from(DataStandard)) or 0
     counts["data_sources"] = db.scalar(select(func.count()).select_from(DataSource)) or 0
     counts["metadata_tables"] = db.scalar(select(func.count()).select_from(MetadataTable)) or 0
     counts["metadata_columns"] = db.scalar(select(func.count()).select_from(MetadataColumn)) or 0
@@ -721,21 +806,30 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 existing.description = str(comment)[:4000]
                 existing.column_count = len(columns)
                 existing.synced_at = datetime.utcnow()
-                existing.columns.clear()
-                # Flush orphan deletes before inserting columns with the same unique keys.
-                db.flush()
+                # Upsert columns by physical name so metadata IDs remain stable across
+                # repeatable syncs; standards/quality mappings reference these IDs.
+                old_columns = {item.column_name: item for item in existing.columns}
+                seen_columns: set[str] = set()
                 for index, col in enumerate(columns, start=1):
+                    column_name = str(col.get("name", ""))
+                    if not column_name:
+                        continue
+                    seen_columns.add(column_name)
                     default = col.get("default")
-                    existing.columns.append(MetadataColumn(
-                        column_name=str(col.get("name", "")),
-                        data_type=str(col.get("type", ""))[:255],
-                        nullable=bool(col.get("nullable", True)),
-                        default_value="" if default is None else str(default)[:1000],
-                        ordinal_position=int(col.get("ordinal") or index),
-                        description=str(col.get("comment") or "")[:4000],
-                        is_primary_key=str(col.get("name", "")) in pk_cols,
-                        is_foreign_key=str(col.get("name", "")) in fk_cols
-                    ))
+                    column_row = old_columns.get(column_name)
+                    if column_row is None:
+                        column_row = MetadataColumn(column_name=column_name)
+                        existing.columns.append(column_row)
+                    column_row.data_type = str(col.get("type", ""))[:255]
+                    column_row.nullable = bool(col.get("nullable", True))
+                    column_row.default_value = "" if default is None else str(default)[:1000]
+                    column_row.ordinal_position = int(col.get("ordinal") or index)
+                    column_row.description = str(col.get("comment") or "")[:4000]
+                    column_row.is_primary_key = column_name in pk_cols
+                    column_row.is_foreign_key = column_name in fk_cols
+                for old_name, old_column in old_columns.items():
+                    if old_name not in seen_columns:
+                        db.delete(old_column)
                 table_count += 1
                 column_count += len(columns)
         stale = db.scalars(select(MetadataTable).where(MetadataTable.source_id == source_id)).all()
@@ -889,6 +983,198 @@ def delete_data_asset(
         raise HTTPException(404, "数据资产不存在")
     db.delete(row)
     db.commit()
+
+
+
+def standard_version_public(row: DataStandardVersion):
+    return {
+        "id": row.id, "standard_id": row.standard_id, "version_number": row.version_number,
+        "definition": row.definition, "data_type": row.data_type, "max_length": row.max_length,
+        "required": row.required, "format_rule": row.format_rule, "value_range": row.value_range,
+        "example": row.example, "status": row.status, "effective_at": row.effective_at,
+        "created_at": row.created_at,
+    }
+
+
+def standard_public(row: DataStandard, include_versions: bool = False):
+    result = {
+        "id": row.id, "standard_code": row.standard_code, "name": row.name,
+        "business_domain": row.business_domain, "description": row.description,
+        "owner_department": row.owner_department, "owner": row.owner,
+        "status": row.status, "current_version": row.current_version,
+        "created_at": row.created_at, "updated_at": row.updated_at,
+    }
+    if include_versions:
+        result["versions"] = [standard_version_public(v) for v in row.versions]
+    else:
+        current = next((v for v in row.versions if v.version_number == row.current_version), None)
+        result["current"] = standard_version_public(current) if current else None
+    return result
+
+
+@app.get("/api/v1/standards")
+def list_data_standards(
+    keyword: str | None = None,
+    business_domain: str | None = None,
+    status: str | None = None,
+    db: Session = Depends(db_session),
+):
+    stmt = select(DataStandard).order_by(DataStandard.updated_at.desc(), DataStandard.id.desc())
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        stmt = stmt.where(DataStandard.standard_code.ilike(like) | DataStandard.name.ilike(like) |
+                          DataStandard.description.ilike(like))
+    if business_domain:
+        stmt = stmt.where(DataStandard.business_domain == business_domain)
+    if status:
+        stmt = stmt.where(DataStandard.status == status)
+    return [standard_public(row) for row in db.scalars(stmt).all()]
+
+
+@app.get("/api/v1/standards/{standard_id}")
+def get_data_standard(standard_id: int, db: Session = Depends(db_session)):
+    row = db.get(DataStandard, standard_id)
+    if not row:
+        raise HTTPException(404, "数据标准不存在")
+    result = standard_public(row, include_versions=True)
+    mappings = []
+    for version in row.versions:
+        for mapping in version.mappings:
+            column = db.get(MetadataColumn, mapping.metadata_column_id)
+            table = db.get(MetadataTable, column.table_id) if column else None
+            source = db.get(DataSource, table.source_id) if table else None
+            mappings.append({
+                "id": mapping.id, "version_id": mapping.version_id,
+                "version_number": version.version_number,
+                "metadata_column_id": mapping.metadata_column_id,
+                "source_name": source.name if source else "",
+                "schema_name": table.schema_name if table else "",
+                "table_name": table.table_name if table else "",
+                "column_name": column.column_name if column else "",
+                "data_type": column.data_type if column else "",
+                "mapping_status": mapping.mapping_status, "note": mapping.note,
+                "mapped_at": mapping.mapped_at,
+            })
+    result["mappings"] = mappings
+    return result
+
+
+@app.post("/api/v1/standards", status_code=201)
+def create_data_standard(
+    payload: DataStandardIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    if db.scalar(select(DataStandard).where(DataStandard.standard_code == payload.standard_code)):
+        raise HTTPException(409, "标准编码已存在")
+    values = payload.model_dump()
+    version_values = {key: values.pop(key) for key in [
+        "definition", "data_type", "max_length", "required", "format_rule", "value_range", "example"
+    ]}
+    row = DataStandard(**values, current_version=1, status="草稿")
+    row.versions.append(DataStandardVersion(version_number=1, status="草稿", **version_values))
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return standard_public(row, include_versions=True)
+
+
+@app.patch("/api/v1/standards/{standard_id}")
+def update_data_standard(
+    standard_id: int,
+    payload: dict,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(DataStandard, standard_id)
+    if not row:
+        raise HTTPException(404, "数据标准不存在")
+    for key in {"name", "business_domain", "description", "owner_department", "owner"}:
+        if key in payload:
+            setattr(row, key, str(payload[key])[:4000])
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return standard_public(row)
+
+
+@app.post("/api/v1/standards/{standard_id}/versions", status_code=201)
+def create_standard_version(
+    standard_id: int,
+    payload: DataStandardVersionIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(DataStandard, standard_id)
+    if not row:
+        raise HTTPException(404, "数据标准不存在")
+    next_version = (db.scalar(select(func.max(DataStandardVersion.version_number)).where(
+        DataStandardVersion.standard_id == standard_id)) or 0) + 1
+    version = DataStandardVersion(standard_id=standard_id, version_number=next_version,
+                                  status="草稿", **payload.model_dump())
+    db.add(version)
+    row.current_version = next_version
+    row.status = "草稿"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(version)
+    return standard_version_public(version)
+
+
+@app.post("/api/v1/standards/{standard_id}/versions/{version_id}/publish")
+def publish_standard_version(
+    standard_id: int,
+    version_id: int,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(DataStandard, standard_id)
+    version = db.get(DataStandardVersion, version_id)
+    if not row or not version or version.standard_id != standard_id:
+        raise HTTPException(404, "标准或版本不存在")
+    if version.version_number != row.current_version:
+        raise HTTPException(409, "只能发布当前编辑版本")
+    for old in row.versions:
+        if old.id != version.id and old.status in {"已发布", "草稿"}:
+            old.status = "已废止"
+    version.status = "已发布"
+    version.effective_at = datetime.utcnow()
+    row.status = "已发布"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    return standard_public(row, include_versions=True)
+
+
+@app.post("/api/v1/standards/{standard_id}/versions/{version_id}/mappings", status_code=201)
+def create_standard_mapping(
+    standard_id: int,
+    version_id: int,
+    payload: DataStandardMappingIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    version = db.get(DataStandardVersion, version_id)
+    if not version or version.standard_id != standard_id:
+        raise HTTPException(404, "标准版本不存在")
+    column = db.get(MetadataColumn, payload.metadata_column_id)
+    if not column:
+        raise HTTPException(404, "元数据字段不存在")
+    existing = db.scalar(select(DataStandardMapping).where(
+        DataStandardMapping.version_id == version_id,
+        DataStandardMapping.metadata_column_id == payload.metadata_column_id,
+    ))
+    if existing:
+        raise HTTPException(409, "该字段已映射到此标准版本")
+    mapping = DataStandardMapping(version_id=version_id, **payload.model_dump())
+    db.add(mapping)
+    db.commit()
+    db.refresh(mapping)
+    return {
+        "id": mapping.id, "version_id": mapping.version_id,
+        "metadata_column_id": mapping.metadata_column_id,
+        "mapping_status": mapping.mapping_status, "note": mapping.note,
+        "mapped_at": mapping.mapped_at,
+    }
 
 
 @app.post("/api/v1/agents/run")
