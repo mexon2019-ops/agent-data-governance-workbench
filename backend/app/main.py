@@ -412,6 +412,7 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
         run.table_count = table_count
         run.column_count = column_count
         run.message = "仅采集数据库结构元数据，未读取业务表数据行。"
+        run.finished_at = datetime.utcnow()
         source.status = "采集成功"
         db.commit()
         return {"success": True, "run_id": run.id, "table_count": table_count,
