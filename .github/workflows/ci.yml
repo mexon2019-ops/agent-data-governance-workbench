@@ -31,7 +31,7 @@ jobs:
       - name: Start backend
         run: |
           cd backend
-          nohup env DATABASE_URL=sqlite:////tmp/governance-smoke.db uvicorn app.main:app --host 127.0.0.1 --port 8000 >/tmp/backend.log 2>&1 &
+          nohup env AUTH_SECRET=ci-test-secret-with-32-characters-minimum-123456 BOOTSTRAP_ADMIN_PASSWORD=ci-bootstrap-password-123456 DATABASE_URL=sqlite:////tmp/governance-smoke.db uvicorn app.main:app --host 127.0.0.1 --port 8000 >/tmp/backend.log 2>&1 &
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health && break || sleep 2; done
       - name: Install frontend and browser
         run: |

@@ -35,6 +35,8 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://dg_user:${POSTGRES_PASSWORD}@postgres:5432/data_governance
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET in .env (at least 32 random characters)}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?Set BOOTSTRAP_ADMIN_PASSWORD in .env (at least 16 characters)}
       MES_DB_PASSWORD: ${MES_DB_PASSWORD:-}
       ORACLE_DB_PASSWORD: ${ORACLE_DB_PASSWORD:-}
       MYSQL_DB_PASSWORD: ${MYSQL_DB_PASSWORD:-}
