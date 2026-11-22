@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install backend dependencies
-        run: pip install -r backend/requirements.txt pytest
+        run: pip install -r backend/requirements.txt pytest httpx==0.28.1
       - name: Run metadata ingestion unit tests
         run: |
           cd backend
