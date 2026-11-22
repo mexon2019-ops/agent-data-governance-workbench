@@ -102,6 +102,11 @@ def test_mysql_sync_is_scoped_to_configured_database(monkeypatch):
             return {"text": "fixture table"}
 
     inspector = FakeInspector()
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
     with main.SessionLocal() as db:
         source = main.DataSource(
             name="mysql-scope-test",
@@ -115,7 +120,7 @@ def test_mysql_sync_is_scoped_to_configured_database(monkeypatch):
         db.add(source)
         db.commit()
         db.refresh(source)
-        monkeypatch.setattr(main, "build_source_engine", lambda _row: object())
+        monkeypatch.setattr(main, "build_source_engine", lambda _row: FakeEngine())
         monkeypatch.setattr(main, "sa_inspect", lambda _engine: inspector)
 
         result = main.sync_metadata(source.id, db)
