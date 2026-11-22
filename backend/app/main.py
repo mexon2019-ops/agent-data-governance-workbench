@@ -183,6 +183,93 @@ def db_session():
         db.close()
 
 
+TOKEN_TTL_SECONDS = int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "28800"))
+
+def _auth_secret() -> bytes:
+    secret = os.getenv("AUTH_SECRET")
+    if not secret or len(secret) < 32:
+        raise RuntimeError("AUTH_SECRET must be configured with at least 32 characters")
+    return secret.encode("utf-8")
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
+    return "pbkdf2_sha256$310000$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        scheme, iterations, salt_b64, digest_b64 = encoded.split("$", 3)
+        if scheme != "pbkdf2_sha256": return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode())
+        expected = base64.urlsafe_b64decode(digest_b64.encode())
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+def issue_token(user: User) -> str:
+    now = int(time.time())
+    payload = {"sub": str(user.id), "username": user.username, "iat": now, "exp": now + TOKEN_TTL_SECONDS}
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    signature = hmac.new(_auth_secret(), body.encode(), hashlib.sha256).digest()
+    return body + "." + base64.urlsafe_b64encode(signature).decode().rstrip("=")
+
+def decode_token(token: str) -> dict[str, Any] | None:
+    try:
+        body, supplied = token.split(".", 1)
+        expected = base64.urlsafe_b64encode(hmac.new(_auth_secret(), body.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        if not hmac.compare_digest(expected, supplied): return None
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        return payload if int(payload["exp"]) > int(time.time()) else None
+    except Exception:
+        return None
+
+def user_public(user: User) -> dict[str, Any]:
+    return {"id": user.id, "username": user.username, "display_name": user.display_name,
+            "is_active": user.is_active, "roles": [r.name for r in user.roles],
+            "permissions": sorted({p.code for r in user.roles for p in r.permissions})}
+
+def current_user(request: Request, authorization: str | None = Header(default=None), db: Session = Depends(db_session)) -> User:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "请先登录")
+    payload = decode_token(authorization[7:])
+    if not payload: raise HTTPException(401, "登录凭证无效或已过期")
+    user = db.get(User, int(payload["sub"]))
+    if not user or not user.is_active: raise HTTPException(401, "用户不存在或已停用")
+    request.state.actor = user.username
+    return user
+
+def require_permission(code: str):
+    def checker(user: User = Depends(current_user)) -> User:
+        permissions = {p.code for role in user.roles for p in role.permissions}
+        if code not in permissions and "system:admin" not in permissions:
+            raise HTTPException(403, "无权执行此操作")
+        return user
+    return checker
+
+def bootstrap_auth(db: Session) -> None:
+    permission_defs = {"user:manage":"管理用户和角色", "governance:read":"查看治理数据", "governance:write":"维护治理数据", "datasource:manage":"管理数据源", "audit:read":"查看操作审计"}
+    perms = {}
+    for code, desc in permission_defs.items():
+        item = db.scalar(select(Permission).where(Permission.code == code))
+        if item is None: item = Permission(code=code, description=desc); db.add(item)
+        perms[code] = item
+    defs = {"admin":("系统管理员",list(permission_defs)), "data_steward":("数据管理员",["governance:read","governance:write","datasource:manage"]), "auditor":("审计员",["governance:read","audit:read"]), "viewer":("只读用户",["governance:read"])}
+    for name, pair in defs.items():
+        desc, codes = pair
+        role = db.scalar(select(Role).where(Role.name == name))
+        if role is None: role = Role(name=name, description=desc); db.add(role)
+        role.permissions = [perms[x] for x in codes]
+    db.flush()
+    password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
+    if password:
+        if len(password) < 16: raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must contain at least 16 characters")
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        if admin is None:
+            admin = User(username="admin", password_hash=hash_password(password), display_name="系统管理员", roles=[db.scalar(select(Role).where(Role.name == "admin"))])
+            db.add(admin)
+    db.commit()
+
 def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
     """Idempotently register the bundled Docker MySQL fixture when explicitly enabled."""
     if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() not in {"1", "true", "yes"}:
