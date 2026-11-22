@@ -779,10 +779,7 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
 
 
 
-def asset_public(row: DataAsset, metadata: MetadataTable | None = None):
-    source = None
-    if metadata is not None:
-        source = None
+def asset_public(row: DataAsset, metadata: MetadataTable | None = None, source_name: str | None = None):
     return {
         "id": row.id, "asset_code": row.asset_code, "name": row.name,
         "metadata_table_id": row.metadata_table_id,
@@ -791,7 +788,7 @@ def asset_public(row: DataAsset, metadata: MetadataTable | None = None):
         "sensitivity_level": row.sensitivity_level, "lifecycle_status": row.lifecycle_status,
         "tags": [tag for tag in row.tags.split(",") if tag],
         "created_at": row.created_at, "updated_at": row.updated_at,
-        "source_name": source,
+        "source_name": source_name or "",
         "schema_name": metadata.schema_name if metadata else "",
         "table_name": metadata.table_name if metadata else "",
     }
@@ -805,9 +802,9 @@ def list_data_assets(
     lifecycle_status: str | None = None,
     db: Session = Depends(db_session),
 ):
-    stmt = select(DataAsset, MetadataTable).outerjoin(
+    stmt = select(DataAsset, MetadataTable, DataSource.name).outerjoin(
         MetadataTable, DataAsset.metadata_table_id == MetadataTable.id
-    )
+    ).outerjoin(DataSource, MetadataTable.source_id == DataSource.id)
     if keyword:
         like = f"%{keyword.strip()}%"
         stmt = stmt.where(
@@ -823,7 +820,7 @@ def list_data_assets(
     if lifecycle_status:
         stmt = stmt.where(DataAsset.lifecycle_status == lifecycle_status)
     stmt = stmt.order_by(DataAsset.updated_at.desc(), DataAsset.id.desc())
-    return [asset_public(asset, metadata) for asset, metadata in db.execute(stmt).all()]
+    return [asset_public(asset, metadata, source_name) for asset, metadata, source_name in db.execute(stmt).all()]
 
 
 @app.post("/api/v1/assets", status_code=201)
@@ -846,7 +843,8 @@ def create_data_asset(
     db.commit()
     db.refresh(row)
     metadata = db.get(MetadataTable, row.metadata_table_id) if row.metadata_table_id else None
-    return asset_public(row, metadata)
+    source = db.get(DataSource, metadata.source_id) if metadata else None
+    return asset_public(row, metadata, source.name if source else "")
 
 
 @app.patch("/api/v1/assets/{asset_id}")
