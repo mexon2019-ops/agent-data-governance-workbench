@@ -1,9 +1,10 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
+from uuid import uuid4
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -21,6 +22,19 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 class Base(DeclarativeBase):
     pass
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36), index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    action: Mapped[str] = mapped_column(String(20), index=True)
+    resource: Mapped[str] = mapped_column(String(255), default="")
+    http_method: Mapped[str] = mapped_column(String(10))
+    path: Mapped[str] = mapped_column(String(500))
+    status_code: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class Record(Base):
@@ -162,6 +176,40 @@ app = FastAPI(title="Agent 数据治理工作台 API", version="0.3.0", lifespan
 allowed_origins = [origin.strip() for origin in os.getenv(
     "CORS_ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173"
 ).split(",") if origin.strip()]
+@app.middleware("http")
+async def audit_mutating_requests(request: Request, call_next):
+    """Record API mutations without capturing request bodies, credentials, or query values."""
+    request_id = str(uuid4())
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    except Exception:
+        status_code = 500
+        raise
+    finally:
+        # Authentication is not yet wired in this sprint. Never trust a caller-
+        # supplied identity header; use an explicit anonymous placeholder.
+        with SessionLocal() as audit_db:
+            audit_db.add(AuditLog(
+                request_id=request_id,
+                actor="anonymous",
+                action=request.method,
+                resource=request.url.path[:255],
+                http_method=request.method,
+                path=request.url.path[:500],
+                status_code=locals().get("status_code", 500),
+            ))
+            audit_db.commit()
+
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
