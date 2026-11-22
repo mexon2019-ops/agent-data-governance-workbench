@@ -297,6 +297,9 @@ def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("BOOTSTRAP_ADMIN_PASSWORD"):
+        with SessionLocal() as auth_db:
+            bootstrap_auth(auth_db)
     if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() in {"1", "true", "yes"}:
         with SessionLocal() as db:
             ensure_mysql_test_datasource(db)
@@ -311,6 +314,15 @@ allowed_origins = [origin.strip() for origin in os.getenv(
 async def audit_mutating_requests(request: Request, call_next):
     """Record API mutations without capturing request bodies, credentials, or query values."""
     request_id = str(uuid4())
+    request.state.actor = "anonymous"
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token_payload = decode_token(auth_header[7:])
+        if token_payload:
+            with SessionLocal() as identity_db:
+                identity = identity_db.get(User, int(token_payload["sub"]))
+                if identity and identity.is_active:
+                    request.state.actor = identity.username
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -328,7 +340,7 @@ async def audit_mutating_requests(request: Request, call_next):
         with SessionLocal() as audit_db:
             audit_db.add(AuditLog(
                 request_id=request_id,
-                actor="anonymous",
+                actor=getattr(request.state, "actor", "anonymous"),
                 action=request.method,
                 resource=request.url.path[:255],
                 http_method=request.method,
@@ -349,6 +361,33 @@ app.add_middleware(
 )
 
 
+@app.post("/api/v1/auth/login")
+def login(payload: LoginIn, db: Session = Depends(db_session)):
+    user = db.scalar(select(User).where(User.username == payload.username))
+    if not user or not user.is_active or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(401, "用户名或密码错误")
+    return {"access_token": issue_token(user), "token_type": "bearer", "expires_in": TOKEN_TTL_SECONDS, "user": user_public(user)}
+
+@app.get("/api/v1/auth/me")
+def auth_me(user: User = Depends(current_user)):
+    return user_public(user)
+
+@app.get("/api/v1/admin/users")
+def list_users(_admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
+    return [user_public(user) for user in db.scalars(select(User).order_by(User.id)).all()]
+
+@app.post("/api/v1/admin/users", status_code=201)
+def create_user(payload: UserCreateIn, _admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
+    if db.scalar(select(User).where(User.username == payload.username)): raise HTTPException(409, "用户名已存在")
+    roles = db.scalars(select(Role).where(Role.name.in_(payload.roles))).all()
+    if len(roles) != len(set(payload.roles)): raise HTTPException(400, "包含不存在的角色")
+    user = User(username=payload.username, password_hash=hash_password(payload.password), display_name=payload.display_name, is_active=True, roles=roles)
+    db.add(user); db.commit(); db.refresh(user)
+    return user_public(user)
+
+@app.get("/api/v1/admin/roles")
+def list_roles(_admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
+    return [{"name": role.name, "description": role.description, "permissions": sorted(p.code for p in role.permissions)} for role in db.scalars(select(Role).order_by(Role.id)).all()]
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "data-governance-api", "version": "0.3.0"}
