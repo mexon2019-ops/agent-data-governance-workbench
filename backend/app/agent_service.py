@@ -13,15 +13,15 @@ from typing import Any
 
 
 REDACTIONS = [
-    (re.compile(r"(?i)\\b[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}\\b"), "[邮箱已脱敏]"),
-    (re.compile(r"(?<!\\d)1[3-9]\\d{9}(?!\\d)"), "[手机号已脱敏]"),
-    (re.compile(r"(?<!\\d)\\d{17}[\\dXx](?!\\d)"), "[证件号已脱敏]"),
-    (re.compile(r"(?<!\\d)(?:\\d{1,3}\\.){3}\\d{1,3}(?!\\d)"), "[IP已脱敏]"),
-    (re.compile(r"(?i)\\b(?:postgres(?:ql)?|mysql|oracle|mssql)://[^\\s]+"), "[数据库连接串已脱敏]"),
-    (re.compile(r"(?i)\\b(password|passwd|token|api[_-]?key|secret)\\s*[:=]\\s*[^\\s,;]+"), r"\\1=[凭据已脱敏]"),
-    (re.compile(r"(?i)(姓名|联系人|责任人|员工姓名|客户姓名)\\s*[:：]\\s*[^，,。;；\\n]+"), r"\\1：[姓名已脱敏]"),
+    (re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b"), "[邮箱已脱敏]"),
+    (re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"), "[手机号已脱敏]"),
+    (re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"), "[证件号已脱敏]"),
+    (re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"), "[IP已脱敏]"),
+    (re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|oracle|mssql)://[^\s]+"), "[数据库连接串已脱敏]"),
+    (re.compile(r"(?i)\b(password|passwd|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+"), r"\1=[凭据已脱敏]"),
+    (re.compile(r"(?i)(姓名|联系人|责任人|员工姓名|客户姓名)\s*[:：]\s*[^，,。;；\n]+"), r"\1：[姓名已脱敏]"),
     (re.compile(r"`[^`]{1,300}`"), "[代码片段已省略]"),
-    (re.compile(r"(?is)\\b(select|insert|update|delete|create|alter|drop)\\b.*"), "[SQL语句已省略]"),
+    (re.compile(r"(?is)\b(select|insert|update|delete|create|alter|drop)\b.*"), "[SQL语句已省略]"),
 ]
 
 
@@ -31,7 +31,7 @@ def sanitize_prompt(prompt: str) -> str:
     for pattern, replacement in REDACTIONS:
         value = pattern.sub(replacement, value)
     # Long digit sequences may be account, order, or identity numbers.
-    value = re.sub(r"(?<!\\d)\\d{6,}(?!\\d)", "[数字标识已脱敏]", value)
+    value = re.sub(r"(?<!\d)\d{6,}(?!\d)", "[数字标识已脱敏]", value)
     return value[:4000]
 
 
@@ -67,14 +67,14 @@ def local_governance_advice(prompt: str, context: dict[str, int]) -> str:
             "通过标准映射、质量检测和整改复测形成可量化闭环。",
         ]
     return (
-        f"建议从“{focus}”切入。\\n\\n"
-        + "\\n".join(f"{i + 1}. {item}" for i, item in enumerate(actions))
-        + "\\n\\n当前工作台汇总："
+        f"建议从“{focus}”切入。\n\n"
+        + "\n".join(f"{i + 1}. {item}" for i, item in enumerate(actions))
+        + "\n\n当前工作台汇总："
         + f"数据资产 {context.get('assets', 0)} 项，"
         + f"数据标准 {context.get('standards', 0)} 项，"
         + f"质量规则 {context.get('quality_rules', 0)} 项，"
         + f"未关闭治理问题 {context.get('open_issues', 0)} 项。"
-        + "\\n以上为治理建议，不代表已执行任何变更；请业务负责人确认后再实施。"
+        + "\n以上为治理建议，不代表已执行任何变更；请业务负责人确认后再实施。"
     )
 
 
@@ -146,7 +146,7 @@ def run_governance_agent(prompt: str, context: dict[str, int]) -> dict[str, Any]
         # Never echo request headers, key, endpoint, or raw upstream error details.
         return {
             "reply": local_governance_advice(sanitized, context)
-            + "\\n\\n提示：外部模型暂不可用，本次已切换为本地规则建议。",
+            + "\n\n提示：外部模型暂不可用，本次已切换为本地规则建议。",
             "provider_status": "fallback_after_error",
             "model": model,
             "sanitized": True,
