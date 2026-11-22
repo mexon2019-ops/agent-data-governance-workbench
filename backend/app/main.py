@@ -1613,9 +1613,12 @@ def recheck_governance_issue(
     if result.get("status") == "成功" and result.get("failed_count") == 0:
         row.status = "待关闭"
         row.review_note = "复测通过：异常记录数为 0，等待治理负责人确认关闭。"
-    else:
+    elif result.get("status") == "成功":
         row.status = "整改中"
         row.review_note = "复测未通过：仍存在 " + str(result.get("failed_count", 0)) + " 条异常记录。"
+    else:
+        row.status = "整改中"
+        row.review_note = "复测执行失败：" + str(result.get("message", "请检查数据源连接和权限。") )
     row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)
