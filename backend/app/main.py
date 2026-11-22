@@ -806,21 +806,30 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 existing.description = str(comment)[:4000]
                 existing.column_count = len(columns)
                 existing.synced_at = datetime.utcnow()
-                existing.columns.clear()
-                # Flush orphan deletes before inserting columns with the same unique keys.
-                db.flush()
+                # Upsert columns by physical name so metadata IDs remain stable across
+                # repeatable syncs; standards/quality mappings reference these IDs.
+                old_columns = {item.column_name: item for item in existing.columns}
+                seen_columns: set[str] = set()
                 for index, col in enumerate(columns, start=1):
+                    column_name = str(col.get("name", ""))
+                    if not column_name:
+                        continue
+                    seen_columns.add(column_name)
                     default = col.get("default")
-                    existing.columns.append(MetadataColumn(
-                        column_name=str(col.get("name", "")),
-                        data_type=str(col.get("type", ""))[:255],
-                        nullable=bool(col.get("nullable", True)),
-                        default_value="" if default is None else str(default)[:1000],
-                        ordinal_position=int(col.get("ordinal") or index),
-                        description=str(col.get("comment") or "")[:4000],
-                        is_primary_key=str(col.get("name", "")) in pk_cols,
-                        is_foreign_key=str(col.get("name", "")) in fk_cols
-                    ))
+                    column_row = old_columns.get(column_name)
+                    if column_row is None:
+                        column_row = MetadataColumn(column_name=column_name)
+                        existing.columns.append(column_row)
+                    column_row.data_type = str(col.get("type", ""))[:255]
+                    column_row.nullable = bool(col.get("nullable", True))
+                    column_row.default_value = "" if default is None else str(default)[:1000]
+                    column_row.ordinal_position = int(col.get("ordinal") or index)
+                    column_row.description = str(col.get("comment") or "")[:4000]
+                    column_row.is_primary_key = column_name in pk_cols
+                    column_row.is_foreign_key = column_name in fk_cols
+                for old_name, old_column in old_columns.items():
+                    if old_name not in seen_columns:
+                        db.delete(old_column)
                 table_count += 1
                 column_count += len(columns)
         stale = db.scalars(select(MetadataTable).where(MetadataTable.source_id == source_id)).all()
