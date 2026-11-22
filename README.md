@@ -10,7 +10,7 @@ V0.3：在 V0.2 八个工作台模块基础上，增加四类关系型数据库�
 5. 数据标准
 6. 数据质量
 7. 治理任务
-8. Agent 助手（当前仍为待接入模型的交互骨架）
+8. Agent 助手（本地治理建议 + 可选 OpenAI-compatible 模型网关，基础脱敏、只读上下文）
 
 ## 技术栈
 - 前端：React + TypeScript + Vite
@@ -41,7 +41,7 @@ docker compose up -d --build
 
 ## 产品方向与 V1.0 路线
 
-本项目正式定位为**企业级数据治理平台，以数据治理为核心，Agent 作为智能辅助能力**。建设顺序为：数据源接入与资产目录 -> 数据标准 -> 数据质量 -> 治理整改闭环 -> 分类分级与血缘 -> Agent 智能辅助 -> FineReport/经营分析扩展。
+本项目正式定位为**企业级数据治理平台，以数据治理为核心，Agent 作为智能辅助能力**。建设顺序为：数据源接入与资产目录 -> 数据标准 -> 数据质量 -> 治理整改闭环 -> Agent 智能辅助 -> 分类分级与血缘 -> FineReport/经营分析扩展。
 
 产品架构、安全基线、核心对象、验收范围和迭代计划见 [V1.0 产品架构与建设计划](docs/PRODUCT-ARCHITECTURE-V1.0.md)。
 
@@ -69,12 +69,17 @@ API：
 ## OpenMetadata 集成策略
 V0.3 先交付轻量元数据采集闭环；OpenMetadata 保留为下一阶段的增强治理引擎，用于扩展统一元数据服务、血缘、治理工作流和更多连接器。官方连接器支持 PostgreSQL、MySQL、Oracle、SQL Server。生产部署需单独评估数据库、搜索引擎和 Ingestion 服务的资源与运维成本，不直接把 Quickstart 组件未经评估地并入企业生产环境。
 
+## Sprint 6：安全治理 Agent
+Agent 已接入本地治理建议服务和可选 OpenAI-compatible 模型网关。模型上下文只包含治理汇总计数，用户问题在外发前执行基础脱敏；Agent 只需要 governance:read，不读取源数据库业务明细，也不具备自动执行治理写操作的能力。未配置模型时自动使用本地规则建议。
+
+模型网关配置项：LLM_API_BASE_URL、LLM_API_KEY、LLM_MODEL、LLM_TIMEOUT_SECONDS。密钥只保存在服务器 .env 或 Docker secrets，不能提交仓库或暴露给前端。
+
+详细配置、安全边界和验收标准见 [Sprint 6 安全治理 Agent](docs/SPRINT-6-SAFE-GOVERNANCE-AGENT.md)。基础脱敏不等同于完整 DLP；生产环境启用外部模型前，仍需企业数据分类分级、敏感实体词典、外发审批和模型供应商合规评估。
+
 ## 当前边界
-- 已有数据源配置、连接测试和元数据采集 API。
-- 数据资产、标准、质量和任务页面仍以基础记录管理为主，尚未形成完整治理流程。
-- Agent 尚未接入 LangGraph 或外部模型；当前不会将提示词发送给第三方。
-- 当前尚无完整登录、RBAC、审批、审计、字段级脱敏和生产级密钥托管；不得直接暴露公网或直接用于生产数据治理。
-- 四种源数据库的驱动依赖、网络、TLS、Oracle service name/SID、SQL Server 实例及权限仍需在目标内网环境做真实联调。
+- 四类数据库连接器已具备配置自动化测试；目标企业内网的真实网络、TLS、Oracle service name/SID、SQL Server 实例及只读权限仍需联调。
+- Agent 当前是只读辅助能力，未接入 LangGraph 多 Agent 编排、知识库检索或自动工作流。
+- 当前不具备完整字段级 DLP、外发审批、企业级密钥托管和生产级高可用能力；部署前仍需完成安全评审和生产环境加固。
 
 ## MySQL 测试库（可选）
 
