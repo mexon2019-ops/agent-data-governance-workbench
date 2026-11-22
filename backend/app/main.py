@@ -920,6 +920,8 @@ def list_metadata_lineage(
     )).all()
     return [{
         "id": edge.id,
+        "source_table_id": table.id,
+        "source_column_id": column.id,
         "source_id": table.source_id,
         "source_name": source_name,
         "source_schema": table.schema_name,
