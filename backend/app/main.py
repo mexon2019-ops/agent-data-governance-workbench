@@ -1071,6 +1071,9 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
         stale = db.scalars(select(MetadataTable).where(MetadataTable.source_id == source_id)).all()
         for old in stale:
             if (old.schema_name, old.table_name) not in discovered:
+                db.execute(delete(MetadataLineage).where(
+                    MetadataLineage.source_table_id == old.id
+                ))
                 db.delete(old)
         run.status = "成功"
         run.table_count = table_count
