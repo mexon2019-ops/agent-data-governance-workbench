@@ -40,7 +40,7 @@ docker compose exec backend alembic upgrade head
 ## 重要注意事项
 
 - 首次基线迁移适用于当前项目已有的空白/新建工作台数据库。
-- 如果已有旧版工作台数据库，其中已经存在业务表但没有 `alembic_version`，不要直接运行自动升级。应先备份数据库，再按迁移接管流程确认现有结构与基线一致，并通过受控的 stamp/校验步骤接管。
+- 如果已有旧版工作台数据库，其中已经存在工作台业务表但没有 `alembic_version`，本次基线迁移会主动终止启动，不会猜测或自动接管。应先备份数据库、核对现有表结构与当前 SQLAlchemy 模型完全一致；确认一致后，由数据库管理员在维护窗口手工执行 `docker compose run --rm backend alembic stamp 0001_baseline`，再正常启动服务。如果结构不一致，必须先设计专门的数据迁移版本，禁止直接 stamp。
 - 生产环境升级前必须备份 PostgreSQL，并在测试环境演练恢复。
 - Alembic 解决结构版本管理，不等于已经完成认证、RBAC、审计或生产安全加固。
 
