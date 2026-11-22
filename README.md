@@ -1,24 +1,41 @@
 # Agent 数据治理工作台
 
-内网部署的 Agent 数据治理工作台 MVP。第一阶段聚焦元数据、数据资产、数据标准、数据质量和治理任务；后续扩展 LangGraph Agent、数据脱敏网关及 FineReport 集成。
+V0.2 MVP：八个工作台模块、FastAPI + PostgreSQL、数据源配置和数据库连通性测试框架。
+
+## 页面
+1. 治理总览
+2. 数据源管理
+3. 数据资产
+4. 元数据目录
+5. 数据标准
+6. 数据质量
+7. 治理任务
+8. Agent 助手
 
 ## 技术栈
 - 前端：React + TypeScript + Vite
-- 后端：FastAPI + SQLAlchemy
-- 业务库：PostgreSQL
-- 部署：Docker Compose
+- 后端：FastAPI + SQLAlchemy 2
+- 元数据库：PostgreSQL
+- 数据源适配器：SQL Server（pymssql）、Oracle（python-oracledb Thin mode）、MySQL（PyMySQL）、PostgreSQL（psycopg）
+- 部署：Docker Compose + Nginx
 
-## 本地 Docker 启动
-1. 复制 `.env.example` 为 `.env` 并设置强密码。
-2. 执行 `docker compose up -d --build`。
-3. 前端访问 http://localhost:8080；API 文档 http://localhost:8000/docs。
+## 启动
+复制 `.env.example` 为 `.env`，设置 `POSTGRES_PASSWORD`，再执行：
 
-## 当前范围
-本版本为开发骨架：基础治理实体 CRUD API 和演示前端。数据源连接器、真实元数据采集、Agent 模型调用、RBAC、审批及脱敏策略尚需后续开发和安全验证。
+```bash
+docker compose up -d --build
+```
 
-## 安全要求
-- 不提交真实密码、Token、模型密钥或生产数据。
-- 数据源凭据只保存密钥引用，不在业务表存明文密码。
-- 连接生产源时使用只读账号并限制网络访问。
-- 外部模型调用前必须经过脱敏和授权校验。
-- 当前版本没有完整认证授权，不可直接暴露到公网或生产环境。
+访问 http://localhost:8080；API 文档 http://localhost:8000/docs。
+
+## 数据源凭据管理
+数据源表只保存密码环境变量名（例如 `MES_DB_PASSWORD`），不保存明文密码。请在后端容器的受控环境中注入对应变量。不要把真实密码提交到 Git。当前 Compose 示例尚未为业务数据库配置密码变量，需按实际环境通过 Docker secrets 或受控部署变量注入。
+
+连接测试会执行只读的 `SELECT 1`。建议为源数据库创建最小权限只读账号，并通过网络策略限制访问。
+
+## 当前实现边界
+- 数据源配置、编辑、删除及连通性测试 API 已实现。
+- 数据资产、元数据目录、数据标准、质量、任务共用治理记录 CRUD API。
+- Agent 页面是交互骨架，尚未接入 LangGraph 或外部模型；不会把用户输入发送到第三方。
+- 当前没有完整登录、RBAC、审批、审计、字段级脱敏和生产级密钥管理，不可直接暴露公网或作为生产系统使用。
+- 数据源驱动在容器环境中的编译/系统依赖与目标数据库版本仍需部署验证。
