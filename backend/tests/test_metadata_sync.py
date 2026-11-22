@@ -47,9 +47,17 @@ def test_metadata_sync_is_repeatable_and_removes_stale_tables(monkeypatch):
             ).all()
             assert {table.table_name for table in tables} == {"customers", "orders"}
             customer_table = next(table for table in tables if table.table_name == "customers")
+            orders_table = next(table for table in tables if table.table_name == "orders")
             detail = main.get_metadata_table(customer_table.id, db)
             assert len(detail["columns"]) == 3
             assert next(c for c in detail["columns"] if c["column_name"] == "id")["is_primary_key"]
+            lineage = db.scalars(select(main.MetadataLineage).where(
+                main.MetadataLineage.source_table_id == orders_table.id
+            )).all()
+            assert len(lineage) == 1
+            assert lineage[0].target_table_name == "customers"
+            assert lineage[0].target_column_name == "id"
+            assert main.list_metadata_lineage(source_id=source.id, db=db)[0]["source_column"] == "customer_id"
 
             customer_column_ids_before = {
                 column.column_name: column.id for column in customer_table.columns
@@ -65,6 +73,7 @@ def test_metadata_sync_is_repeatable_and_removes_stale_tables(monkeypatch):
                 column.column_name: column.id for column in customer_table.columns
             }
             assert customer_column_ids_after == customer_column_ids_before
+            assert db.query(main.MetadataLineage).count() == 1
 
             with source_engine.begin() as conn:
                 conn.exec_driver_sql("DROP TABLE orders")
@@ -75,6 +84,7 @@ def test_metadata_sync_is_repeatable_and_removes_stale_tables(monkeypatch):
                 select(main.MetadataTable).where(main.MetadataTable.source_id == source.id)
             ).all()
             assert [table.table_name for table in remaining] == ["customers"]
+            assert db.query(main.MetadataLineage).count() == 0
             runs = db.scalars(
                 select(main.MetadataSyncRun).where(main.MetadataSyncRun.source_id == source.id)
             ).all()
