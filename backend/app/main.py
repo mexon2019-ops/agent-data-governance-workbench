@@ -340,12 +340,17 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
     try:
         source_engine = build_source_engine(source)
         inspector = sa_inspect(source_engine)
-        schemas = inspector.get_schema_names()
-        excluded = {"information_schema", "performance_schema", "mysql", "sys",
-                    "pg_catalog", "pg_toast", "information_schema", "sysaux", "system", "xdb"}
-        schemas = [s for s in schemas if s.lower() not in excluded]
-        if not schemas:
-            schemas = [None]
+        # MySQL exposes multiple databases as schemas. Restrict collection to the
+        # database explicitly configured for this datasource to avoid catalog sprawl.
+        if source.db_type == "mysql":
+            schemas = [source.database]
+        else:
+            schemas = inspector.get_schema_names()
+            excluded = {"information_schema", "performance_schema", "mysql", "sys",
+                        "pg_catalog", "pg_toast", "sysaux", "system", "xdb"}
+            schemas = [s for s in schemas if s.lower() not in excluded]
+            if not schemas:
+                schemas = [None]
         discovered: set[tuple[str, str]] = set()
         table_count = 0
         column_count = 0
@@ -354,8 +359,8 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
             try:
                 table_names = inspector.get_table_names(schema=schema)
                 view_names = inspector.get_view_names(schema=schema)
-            except Exception:
-                continue
+            except Exception as exc:
+                raise RuntimeError(f"无法读取数据库 {schema_name or source.database} 的表目录：{type(exc).__name__}") from exc
             for table_name in sorted(set(table_names + view_names)):
                 key = (schema_name, table_name)
                 discovered.add(key)
