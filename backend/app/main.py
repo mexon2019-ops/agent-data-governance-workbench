@@ -390,6 +390,8 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 existing.column_count = len(columns)
                 existing.synced_at = datetime.utcnow()
                 existing.columns.clear()
+                # Flush orphan deletes before inserting columns with the same unique keys.
+                db.flush()
                 for index, col in enumerate(columns, start=1):
                     default = col.get("default")
                     existing.columns.append(MetadataColumn(
