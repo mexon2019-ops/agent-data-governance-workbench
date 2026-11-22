@@ -19,11 +19,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install backend dependencies
-        run: pip install fastapi==0.115.12 uvicorn==0.34.2 SQLAlchemy==2.0.40 pytest
+        run: pip install fastapi==0.115.12 uvicorn==0.34.2 SQLAlchemy==2.0.40 alembic==1.15.2 pytest
       - name: Run metadata ingestion unit tests
         run: |
           cd backend
           DATABASE_URL=sqlite:////tmp/metadata-unit-ci.db PYTHONPATH=. pytest -q
+      - name: Apply database migrations
+        run: |
+          cd backend
+          DATABASE_URL=sqlite:////tmp/governance-smoke.db PYTHONPATH=. alembic upgrade head
       - name: Start backend
         run: |
           cd backend
