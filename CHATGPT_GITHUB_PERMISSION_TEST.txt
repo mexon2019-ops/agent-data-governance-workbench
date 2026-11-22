@@ -1,3 +1,0 @@
-GitHub permission test
-Created by ChatGPT to verify repository write access.
-This temporary file will be removed after verification.
