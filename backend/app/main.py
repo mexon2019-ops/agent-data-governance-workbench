@@ -11,6 +11,7 @@ from uuid import uuid4
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Header
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -322,6 +323,28 @@ async def audit_mutating_requests(request: Request, call_next):
                 identity = identity_db.get(User, int(token_payload["sub"]))
                 if identity and identity.is_active:
                     request.state.actor = identity.username
+    # Enforce authentication for every API except login. Health checks and CORS
+    # preflight requests remain public. Admin endpoints perform their own RBAC checks.
+    if request.url.path.startswith("/api/v1/") and request.url.path != "/api/v1/auth/login" and request.method != "OPTIONS":
+        if request.state.actor == "anonymous":
+            return JSONResponse(status_code=401, content={"detail": "请先登录"},
+                                headers={"X-Request-ID": request_id})
+        if not request.url.path.startswith("/api/v1/admin/") and request.url.path != "/api/v1/auth/me":
+            required = "governance:read"
+            path = request.url.path
+            method = request.method
+            if path.startswith("/api/v1/datasources") and method in {"POST", "PATCH", "DELETE"}:
+                required = "datasource:manage"
+            elif path.startswith("/api/v1/records") and method in {"POST", "PUT", "PATCH", "DELETE"}:
+                required = "governance:write"
+            elif path.startswith("/api/v1/datasources/") and (path.endswith("/test") or path.endswith("/sync")):
+                required = "datasource:manage"
+            with SessionLocal() as permission_db:
+                identity = permission_db.scalar(select(User).where(User.username == request.state.actor))
+                permissions = {p.code for role in identity.roles for p in role.permissions} if identity else set()
+            if required not in permissions:
+                return JSONResponse(status_code=403, content={"detail": "无权执行此操作"},
+                                    headers={"X-Request-ID": request_id})
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
