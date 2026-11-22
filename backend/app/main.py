@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint,
-    create_engine, select, func, delete
+    create_engine, select, func, delete, MetaData, Table, and_, or_, cast
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -217,6 +217,37 @@ class DataStandardMapping(Base):
     mapped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     version: Mapped[DataStandardVersion] = relationship(back_populates="mappings")
 
+class QualityRule(Base):
+    __tablename__ = "quality_rules"
+    __table_args__ = (UniqueConstraint("rule_code", name="uq_quality_rule_code"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_code: Mapped[str] = mapped_column(String(80), index=True)
+    name: Mapped[str] = mapped_column(String(180), index=True)
+    metadata_table_id: Mapped[int] = mapped_column(ForeignKey("metadata_tables.id", ondelete="CASCADE"), index=True)
+    metadata_column_id: Mapped[int] = mapped_column(ForeignKey("metadata_columns.id", ondelete="CASCADE"), index=True)
+    standard_version_id: Mapped[int | None] = mapped_column(ForeignKey("data_standard_versions.id", ondelete="SET NULL"), nullable=True)
+    rule_type: Mapped[str] = mapped_column(String(30), index=True)
+    severity: Mapped[str] = mapped_column(String(20), default="中")
+    threshold_rate: Mapped[float] = mapped_column(Float, default=100.0)
+    config: Mapped[str] = mapped_column(Text, default="{}")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class QualityRun(Base):
+    __tablename__ = "quality_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("quality_rules.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="运行中")
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    pass_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
 
 class LoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=80)
@@ -291,6 +322,17 @@ class DataStandardMappingIn(BaseModel):
     metadata_column_id: int
     mapping_status: str = Field(default="待核验", pattern="^(待核验|已落标|不符合)$")
     note: str = Field(default="", max_length=2000)
+
+class QualityRuleIn(BaseModel):
+    rule_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=1, max_length=180)
+    metadata_table_id: int
+    metadata_column_id: int
+    standard_version_id: int | None = None
+    rule_type: str = Field(pattern="^(completeness|uniqueness|range|enum)$")
+    severity: str = Field(default="中", pattern="^(低|中|高)$")
+    threshold_rate: float = Field(default=100.0, ge=0, le=100)
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 def db_session():
@@ -1175,6 +1217,217 @@ def create_standard_mapping(
         "mapping_status": mapping.mapping_status, "note": mapping.note,
         "mapped_at": mapping.mapped_at,
     }
+
+
+
+def quality_rule_public(row: QualityRule):
+    return {
+        "id": row.id, "rule_code": row.rule_code, "name": row.name,
+        "metadata_table_id": row.metadata_table_id, "metadata_column_id": row.metadata_column_id,
+        "standard_version_id": row.standard_version_id, "rule_type": row.rule_type,
+        "severity": row.severity, "threshold_rate": row.threshold_rate,
+        "config": json.loads(row.config or "{}"), "enabled": row.enabled,
+        "created_at": row.created_at, "updated_at": row.updated_at,
+    }
+
+
+@app.get("/api/v1/quality/rules")
+def list_quality_rules(
+    keyword: str | None = None,
+    rule_type: str | None = None,
+    enabled: bool | None = None,
+    db: Session = Depends(db_session),
+):
+    stmt = select(QualityRule).order_by(QualityRule.updated_at.desc(), QualityRule.id.desc())
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        stmt = stmt.where(QualityRule.name.ilike(like) | QualityRule.rule_code.ilike(like))
+    if rule_type:
+        stmt = stmt.where(QualityRule.rule_type == rule_type)
+    if enabled is not None:
+        stmt = stmt.where(QualityRule.enabled == enabled)
+    return [quality_rule_public(row) for row in db.scalars(stmt).all()]
+
+
+@app.post("/api/v1/quality/rules", status_code=201)
+def create_quality_rule(
+    payload: QualityRuleIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    if db.scalar(select(QualityRule).where(QualityRule.rule_code == payload.rule_code)):
+        raise HTTPException(409, "质量规则编码已存在")
+    table = db.get(MetadataTable, payload.metadata_table_id)
+    column = db.get(MetadataColumn, payload.metadata_column_id)
+    if not table or not column or column.table_id != table.id:
+        raise HTTPException(400, "所选字段不属于指定元数据表")
+    if payload.standard_version_id is not None and not db.get(DataStandardVersion, payload.standard_version_id):
+        raise HTTPException(404, "关联的数据标准版本不存在")
+    config = payload.config
+    if payload.rule_type == "range":
+        if "min" not in config and "max" not in config:
+            raise HTTPException(422, "范围规则至少需要配置 min 或 max")
+        for key in ("min", "max"):
+            if key in config and not isinstance(config[key], (int, float)):
+                raise HTTPException(422, "范围边界必须为数字")
+        if "min" in config and "max" in config and config["min"] > config["max"]:
+            raise HTTPException(422, "范围规则 min 不能大于 max")
+    if payload.rule_type == "enum":
+        values = config.get("allowed_values")
+        if not isinstance(values, list) or not values or len(values) > 500:
+            raise HTTPException(422, "枚举规则必须配置 1-500 个 allowed_values")
+        if any(not isinstance(value, (str, int, float, bool)) for value in values):
+            raise HTTPException(422, "枚举值只能是字符串、数字或布尔值")
+    if payload.rule_type in {"completeness", "uniqueness"} and config:
+        raise HTTPException(422, "该规则类型不接受额外配置")
+    row = QualityRule(
+        **payload.model_dump(exclude={"config"}),
+        config=json.dumps(config, ensure_ascii=False),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return quality_rule_public(row)
+
+
+@app.patch("/api/v1/quality/rules/{rule_id}")
+def update_quality_rule(
+    rule_id: int,
+    payload: dict,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(QualityRule, rule_id)
+    if not row:
+        raise HTTPException(404, "质量规则不存在")
+    if "enabled" in payload:
+        row.enabled = bool(payload["enabled"])
+    if "severity" in payload:
+        if payload["severity"] not in {"低", "中", "高"}:
+            raise HTTPException(422, "无效的严重级别")
+        row.severity = payload["severity"]
+    if "threshold_rate" in payload:
+        try:
+            value = float(payload["threshold_rate"])
+        except (TypeError, ValueError):
+            raise HTTPException(422, "通过率阈值必须为数字")
+        if not 0 <= value <= 100:
+            raise HTTPException(422, "通过率阈值必须在 0-100 之间")
+        row.threshold_rate = value
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return quality_rule_public(row)
+
+
+def run_quality_rule(rule_id: int, db: Session):
+    rule = db.get(QualityRule, rule_id)
+    if not rule:
+        raise HTTPException(404, "质量规则不存在")
+    if not rule.enabled:
+        raise HTTPException(409, "该质量规则已停用")
+    metadata_table = db.get(MetadataTable, rule.metadata_table_id)
+    metadata_column = db.get(MetadataColumn, rule.metadata_column_id)
+    source = db.get(DataSource, metadata_table.source_id) if metadata_table else None
+    if not metadata_table or not metadata_column or metadata_column.table_id != metadata_table.id or not source:
+        raise HTTPException(409, "规则关联的元数据对象已失效，请重新配置规则")
+    run = QualityRun(rule_id=rule.id, status="运行中", started_at=datetime.utcnow())
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    source_engine = None
+    try:
+        source_engine = build_source_engine(source)
+        reflected = Table(
+            metadata_table.table_name, MetaData(), schema=metadata_table.schema_name or None,
+            autoload_with=source_engine,
+        )
+        column = reflected.c.get(metadata_column.column_name)
+        if column is None:
+            raise ValueError("源数据库中已找不到该字段，请重新采集元数据")
+        config = json.loads(rule.config or "{}")
+        if rule.rule_type == "completeness":
+            invalid = column.is_(None)
+        elif rule.rule_type == "uniqueness":
+            duplicates = select(column.label("value"), func.count().label("duplicate_count")).where(
+                column.is_not(None)
+            ).group_by(column).having(func.count() > 1).subquery()
+            failed_statement = select(func.coalesce(func.sum(duplicates.c.duplicate_count), 0))
+            with source_engine.connect() as conn:
+                total = conn.scalar(select(func.count()).select_from(reflected)) or 0
+                failed = conn.scalar(failed_statement) or 0
+            run.total_count = int(total)
+            run.failed_count = int(failed)
+            run.message = "重复值按涉及的重复记录数统计；NULL 不参与唯一性判断。"
+            invalid = None
+        elif rule.rule_type == "range":
+            clauses = []
+            if "min" in config:
+                clauses.append(column < config["min"])
+            if "max" in config:
+                clauses.append(column > config["max"])
+            invalid = and_(column.is_not(None), or_(*clauses))
+        elif rule.rule_type == "enum":
+            invalid = and_(column.is_not(None), column.not_in(config["allowed_values"]))
+        else:
+            raise ValueError("不支持的质量规则类型")
+        if invalid is not None:
+            with source_engine.connect() as conn:
+                total = conn.scalar(select(func.count()).select_from(reflected)) or 0
+                failed = conn.scalar(select(func.count()).select_from(reflected).where(invalid)) or 0
+            run.total_count = int(total)
+            run.failed_count = int(failed)
+        pass_rate = 100.0 if run.total_count == 0 else max(0.0, (run.total_count - run.failed_count) / run.total_count * 100)
+        run.pass_rate = round(pass_rate, 2)
+        run.passed = pass_rate >= rule.threshold_rate
+        run.status = "成功"
+        run.message = run.message or "只读检测完成，未修改源数据库数据。"
+        run.finished_at = datetime.utcnow()
+        db.commit()
+        return {
+            "id": run.id, "rule_id": run.rule_id, "status": run.status,
+            "total_count": run.total_count, "failed_count": run.failed_count,
+            "pass_rate": run.pass_rate, "passed": run.passed, "message": run.message,
+            "started_at": run.started_at, "finished_at": run.finished_at,
+        }
+    except Exception as exc:
+        db.rollback()
+        failed_run = db.get(QualityRun, run.id)
+        failed_run.status = "失败"
+        failed_run.message = f"检测失败：{type(exc).__name__}。请检查源库连接、字段类型和只读账号权限。"
+        failed_run.finished_at = datetime.utcnow()
+        db.commit()
+        return {
+            "id": failed_run.id, "rule_id": failed_run.rule_id, "status": failed_run.status,
+            "total_count": failed_run.total_count, "failed_count": failed_run.failed_count,
+            "pass_rate": failed_run.pass_rate, "passed": False, "message": failed_run.message,
+            "started_at": failed_run.started_at, "finished_at": failed_run.finished_at,
+        }
+    finally:
+        if source_engine is not None:
+            source_engine.dispose()
+
+
+@app.post("/api/v1/quality/rules/{rule_id}/run")
+def execute_quality_rule(
+    rule_id: int,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    return run_quality_rule(rule_id, db)
+
+
+@app.get("/api/v1/quality/rules/{rule_id}/runs")
+def list_quality_runs(rule_id: int, db: Session = Depends(db_session)):
+    if not db.get(QualityRule, rule_id):
+        raise HTTPException(404, "质量规则不存在")
+    rows = db.scalars(select(QualityRun).where(QualityRun.rule_id == rule_id).order_by(QualityRun.id.desc()).limit(20)).all()
+    return [{
+        "id": row.id, "rule_id": row.rule_id, "status": row.status,
+        "total_count": row.total_count, "failed_count": row.failed_count,
+        "pass_rate": row.pass_rate, "passed": row.passed, "message": row.message,
+        "started_at": row.started_at, "finished_at": row.finished_at,
+    } for row in rows]
 
 
 @app.post("/api/v1/agents/run")
