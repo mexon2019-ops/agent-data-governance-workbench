@@ -1,20 +1,18 @@
 import os
-import base64
-import hashlib
-import hmac
-import json
-import secrets
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import uuid4
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Header
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+import jwt
+from jwt import InvalidTokenError
+from pwdlib import PasswordHash
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint,
+    Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
     create_engine, select, func, delete
 )
 from sqlalchemy.engine import URL
@@ -30,25 +28,32 @@ class Base(DeclarativeBase):
     pass
 
 
-user_roles = Table("user_roles", Base.metadata,
-    Column("user_id", ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
-    Column("role_id", ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True))
-role_permissions = Table("role_permissions", Base.metadata,
-    Column("role_id", ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True),
-    Column("permission_id", ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True))
 class Role(Base):
     __tablename__ = "roles"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(50), unique=True, index=True)
-    description: Mapped[str] = mapped_column(String(255), default="")
-    permissions: Mapped[list["Permission"]] = relationship(secondary=role_permissions, back_populates="roles")
-    users: Mapped[list["User"]] = relationship(secondary=user_roles, back_populates="roles")
+    code: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(Text, default="")
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Permission(Base):
     __tablename__ = "permissions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     code: Mapped[str] = mapped_column(String(100), unique=True, index=True)
-    description: Mapped[str] = mapped_column(String(255), default="")
-    roles: Mapped[list[Role]] = relationship(secondary=role_permissions, back_populates="permissions")
+    name: Mapped[str] = mapped_column(String(120))
+    resource: Mapped[str] = mapped_column(String(100))
+    action: Mapped[str] = mapped_column(String(40))
+
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+    __table_args__ = (UniqueConstraint("role_id", "permission_id", name="uq_role_permission"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id", ondelete="CASCADE"), index=True)
+    permission_id: Mapped[int] = mapped_column(ForeignKey("permissions.id", ondelete="CASCADE"), index=True)
+
+
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -56,8 +61,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[str] = mapped_column(String(120), default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    roles: Mapped[list[Role]] = relationship(secondary=user_roles, back_populates="users")
+
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
@@ -143,14 +149,13 @@ class MetadataSyncRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class LoginIn(BaseModel):
-    username: str = Field(min_length=1, max_length=80)
-    password: str = Field(min_length=1, max_length=256)
-class UserCreateIn(BaseModel):
-    username: str = Field(min_length=3, max_length=80, pattern="^[A-Za-z0-9_.-]+$")
-    password: str = Field(min_length=12, max_length=256)
-    display_name: str = Field(default="", max_length=120)
-    roles: list[str] = Field(default_factory=lambda: ["viewer"])
+class UserPublic(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    is_active: bool
+    role: str
+
 
 class RecordIn(BaseModel):
     category: str = Field(min_length=1, max_length=40)
@@ -183,93 +188,6 @@ def db_session():
         db.close()
 
 
-TOKEN_TTL_SECONDS = int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "28800"))
-
-def _auth_secret() -> bytes:
-    secret = os.getenv("AUTH_SECRET")
-    if not secret or len(secret) < 32:
-        raise RuntimeError("AUTH_SECRET must be configured with at least 32 characters")
-    return secret.encode("utf-8")
-
-def hash_password(password: str) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
-    return "pbkdf2_sha256$310000$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
-
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        scheme, iterations, salt_b64, digest_b64 = encoded.split("$", 3)
-        if scheme != "pbkdf2_sha256": return False
-        salt = base64.urlsafe_b64decode(salt_b64.encode())
-        expected = base64.urlsafe_b64decode(digest_b64.encode())
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(iterations))
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError):
-        return False
-
-def issue_token(user: User) -> str:
-    now = int(time.time())
-    payload = {"sub": str(user.id), "username": user.username, "iat": now, "exp": now + TOKEN_TTL_SECONDS}
-    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
-    signature = hmac.new(_auth_secret(), body.encode(), hashlib.sha256).digest()
-    return body + "." + base64.urlsafe_b64encode(signature).decode().rstrip("=")
-
-def decode_token(token: str) -> dict[str, Any] | None:
-    try:
-        body, supplied = token.split(".", 1)
-        expected = base64.urlsafe_b64encode(hmac.new(_auth_secret(), body.encode(), hashlib.sha256).digest()).decode().rstrip("=")
-        if not hmac.compare_digest(expected, supplied): return None
-        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-        return payload if int(payload["exp"]) > int(time.time()) else None
-    except Exception:
-        return None
-
-def user_public(user: User) -> dict[str, Any]:
-    return {"id": user.id, "username": user.username, "display_name": user.display_name,
-            "is_active": user.is_active, "roles": [r.name for r in user.roles],
-            "permissions": sorted({p.code for r in user.roles for p in r.permissions})}
-
-def current_user(request: Request, authorization: str | None = Header(default=None), db: Session = Depends(db_session)) -> User:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "请先登录")
-    payload = decode_token(authorization[7:])
-    if not payload: raise HTTPException(401, "登录凭证无效或已过期")
-    user = db.get(User, int(payload["sub"]))
-    if not user or not user.is_active: raise HTTPException(401, "用户不存在或已停用")
-    request.state.actor = user.username
-    return user
-
-def require_permission(code: str):
-    def checker(user: User = Depends(current_user)) -> User:
-        permissions = {p.code for role in user.roles for p in role.permissions}
-        if code not in permissions and "system:admin" not in permissions:
-            raise HTTPException(403, "无权执行此操作")
-        return user
-    return checker
-
-def bootstrap_auth(db: Session) -> None:
-    permission_defs = {"user:manage":"管理用户和角色", "governance:read":"查看治理数据", "governance:write":"维护治理数据", "datasource:manage":"管理数据源", "audit:read":"查看操作审计"}
-    perms = {}
-    for code, desc in permission_defs.items():
-        item = db.scalar(select(Permission).where(Permission.code == code))
-        if item is None: item = Permission(code=code, description=desc); db.add(item)
-        perms[code] = item
-    defs = {"admin":("系统管理员",list(permission_defs)), "data_steward":("数据管理员",["governance:read","governance:write","datasource:manage"]), "auditor":("审计员",["governance:read","audit:read"]), "viewer":("只读用户",["governance:read"])}
-    for name, pair in defs.items():
-        desc, codes = pair
-        role = db.scalar(select(Role).where(Role.name == name))
-        if role is None: role = Role(name=name, description=desc); db.add(role)
-        role.permissions = [perms[x] for x in codes]
-    db.flush()
-    password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
-    if password:
-        if len(password) < 16: raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD must contain at least 16 characters")
-        admin = db.scalar(select(User).where(User.username == "admin"))
-        if admin is None:
-            admin = User(username="admin", password_hash=hash_password(password), display_name="系统管理员", roles=[db.scalar(select(Role).where(Role.name == "admin"))])
-            db.add(admin)
-    db.commit()
-
 def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
     """Idempotently register the bundled Docker MySQL fixture when explicitly enabled."""
     if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() not in {"1", "true", "yes"}:
@@ -297,15 +215,91 @@ def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    with SessionLocal() as auth_db:
-        bootstrap_auth(auth_db)
     if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() in {"1", "true", "yes"}:
         with SessionLocal() as db:
             ensure_mysql_test_datasource(db)
     yield
 
 
-app = FastAPI(title="Agent 数据治理工作台 API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Agent 数据治理工作台 API", version="0.4.0", lifespan=lifespan)
+
+password_hash = PasswordHash.recommended()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+
+
+def get_jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET_KEY", "")
+    if len(secret) < 32:
+        raise HTTPException(status_code=503, detail="服务端 JWT_SECRET_KEY 未配置或长度不足 32 位")
+    return secret
+
+
+def get_current_user(token: str | None = Depends(oauth2_scheme), db: Session = Depends(db_session)):
+    if not token:
+        raise HTTPException(status_code=401, detail="请先登录", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        user_id = int(payload.get("sub", "0"))
+    except (InvalidTokenError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="登录凭证无效或已过期", headers={"WWW-Authenticate": "Bearer"})
+    user = db.get(User, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="用户不存在或已停用")
+    return user
+
+
+def require_permission(permission_code: str):
+    def checker(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+        stmt = select(Permission.code).join(RolePermission, RolePermission.permission_id == Permission.id).where(
+            RolePermission.role_id == user.role_id, Permission.code == permission_code
+        )
+        if db.scalar(stmt) is None:
+            raise HTTPException(status_code=403, detail="当前角色没有此操作权限")
+        return user
+    return checker
+
+
+@app.post("/api/v1/auth/token")
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(db_session)):
+    user = db.scalar(select(User).where(User.username == form.username))
+    if not user or not user.is_active or not password_hash.verify(form.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误", headers={"WWW-Authenticate": "Bearer"})
+    token = jwt.encode(
+        {"sub": str(user.id), "username": user.username,
+         "exp": datetime.utcnow().timestamp() + JWT_EXPIRE_MINUTES * 60},
+        get_jwt_secret(), algorithm=JWT_ALGORITHM
+    )
+    return {"access_token": token, "token_type": "bearer", "expires_in": JWT_EXPIRE_MINUTES * 60}
+
+
+@app.get("/api/v1/auth/me")
+def auth_me(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+    role = db.get(Role, user.role_id)
+    permission_stmt = select(Permission.code).join(
+        RolePermission, RolePermission.permission_id == Permission.id
+    ).where(RolePermission.role_id == user.role_id)
+    return {"id": user.id, "username": user.username, "display_name": user.display_name,
+            "is_active": user.is_active, "role": role.code if role else "",
+            "permissions": list(db.scalars(permission_stmt).all())}
+
+
+@app.get("/api/v1/admin/roles")
+def list_roles(user: User = Depends(require_permission("iam:role:read")),
+               db: Session = Depends(db_session)):
+    rows = db.scalars(select(Role).order_by(Role.id)).all()
+    return [{"id": r.id, "code": r.code, "name": r.name, "description": r.description}
+            for r in rows]
+
+
+@app.get("/api/v1/admin/users")
+def list_users(user: User = Depends(require_permission("iam:user:read")),
+               db: Session = Depends(db_session)):
+    rows = db.scalars(select(User).order_by(User.id)).all()
+    return [{"id": u.id, "username": u.username, "display_name": u.display_name,
+             "is_active": u.is_active, "role_id": u.role_id} for u in rows]
+
 allowed_origins = [origin.strip() for origin in os.getenv(
     "CORS_ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173"
 ).split(",") if origin.strip()]
@@ -313,15 +307,6 @@ allowed_origins = [origin.strip() for origin in os.getenv(
 async def audit_mutating_requests(request: Request, call_next):
     """Record API mutations without capturing request bodies, credentials, or query values."""
     request_id = str(uuid4())
-    request.state.actor = "anonymous"
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.startswith("Bearer "):
-        token_payload = decode_token(auth_header[7:])
-        if token_payload:
-            with SessionLocal() as identity_db:
-                identity = identity_db.get(User, int(token_payload["sub"]))
-                if identity and identity.is_active:
-                    request.state.actor = identity.username
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -334,12 +319,21 @@ async def audit_mutating_requests(request: Request, call_next):
         status_code = 500
         raise
     finally:
-        # Authentication is not yet wired in this sprint. Never trust a caller-
-        # supplied identity header; use an explicit anonymous placeholder.
+        # Resolve the actor only from a cryptographically verified bearer token.
+        # Never trust caller-supplied identity headers.
+        actor = "anonymous"
+        authorization = request.headers.get("authorization", "")
+        if authorization.lower().startswith("bearer "):
+            try:
+                claims = jwt.decode(authorization.split(" ", 1)[1], get_jwt_secret(),
+                                    algorithms=[JWT_ALGORITHM])
+                actor = str(claims.get("sub") or "anonymous")
+            except (InvalidTokenError, HTTPException, ValueError, TypeError):
+                actor = "anonymous"
         with SessionLocal() as audit_db:
             audit_db.add(AuditLog(
                 request_id=request_id,
-                actor=getattr(request.state, "actor", "anonymous"),
+                actor=actor,
                 action=request.method,
                 resource=request.url.path[:255],
                 http_method=request.method,
@@ -360,33 +354,6 @@ app.add_middleware(
 )
 
 
-@app.post("/api/v1/auth/login")
-def login(payload: LoginIn, db: Session = Depends(db_session)):
-    user = db.scalar(select(User).where(User.username == payload.username))
-    if not user or not user.is_active or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(401, "用户名或密码错误")
-    return {"access_token": issue_token(user), "token_type": "bearer", "expires_in": TOKEN_TTL_SECONDS, "user": user_public(user)}
-
-@app.get("/api/v1/auth/me")
-def auth_me(user: User = Depends(current_user)):
-    return user_public(user)
-
-@app.get("/api/v1/admin/users")
-def list_users(_admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
-    return [user_public(user) for user in db.scalars(select(User).order_by(User.id)).all()]
-
-@app.post("/api/v1/admin/users", status_code=201)
-def create_user(payload: UserCreateIn, _admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
-    if db.scalar(select(User).where(User.username == payload.username)): raise HTTPException(409, "用户名已存在")
-    roles = db.scalars(select(Role).where(Role.name.in_(payload.roles))).all()
-    if len(roles) != len(set(payload.roles)): raise HTTPException(400, "包含不存在的角色")
-    user = User(username=payload.username, password_hash=hash_password(payload.password), display_name=payload.display_name, is_active=True, roles=roles)
-    db.add(user); db.commit(); db.refresh(user)
-    return user_public(user)
-
-@app.get("/api/v1/admin/roles")
-def list_roles(_admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
-    return [{"name": role.name, "description": role.description, "permissions": sorted(p.code for p in role.permissions)} for role in db.scalars(select(Role).order_by(Role.id)).all()]
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "data-governance-api", "version": "0.3.0"}
