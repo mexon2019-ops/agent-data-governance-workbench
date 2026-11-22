@@ -186,3 +186,48 @@ def test_audit_log_model_persists_mutation_metadata_without_payload():
         assert saved.status_code == 201
         assert not hasattr(saved, "request_body")
         assert not hasattr(saved, "password")
+
+
+def test_jwt_login_and_current_user(monkeypatch):
+    from fastapi.testclient import TestClient
+    import uuid
+
+    main.Base.metadata.create_all(main.engine)
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-only-secret-key-with-more-than-32-characters")
+    username = "auth-test-" + uuid.uuid4().hex[:10]
+    with main.SessionLocal() as db:
+        role = main.Role(code="test-role-" + uuid.uuid4().hex[:8], name="测试角色")
+        db.add(role)
+        db.flush()
+        user = main.User(
+            username=username,
+            password_hash=main.password_hash.hash("Correct-Horse-Battery-2026!"),
+            display_name="认证测试用户",
+            role_id=role.id,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+
+    with TestClient(main.app) as client:
+        unauthenticated = client.get("/api/v1/auth/me")
+        assert unauthenticated.status_code == 401
+        login = client.post("/api/v1/auth/token", data={
+            "username": username,
+            "password": "Correct-Horse-Battery-2026!",
+        })
+        assert login.status_code == 200
+        token = login.json()["access_token"]
+        profile = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert profile.status_code == 200
+        assert profile.json()["username"] == username
+        assert profile.json()["role"].startswith("test-role-")
+        assert "access_token" not in profile.json()
+
+
+def test_password_hash_does_not_store_plaintext():
+    raw = "Another-Strong-Password-2026!"
+    hashed = main.password_hash.hash(raw)
+    assert hashed != raw
+    assert main.password_hash.verify(raw, hashed)
+    assert not main.password_hash.verify("wrong-password", hashed)
