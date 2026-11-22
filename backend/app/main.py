@@ -171,15 +171,15 @@ def test_datasource(source_id: int, db: Session = Depends(db_session)):
     if not password:
         raise HTTPException(400, f"服务端未配置环境变量 {row.password_env_key}；密码不会存入数据库")
     drivers = {
-        "sqlserver": ("mssql+pymssql", "master"),
-        "oracle": ("oracle+oracledb", row.database),
-        "mysql": ("mysql+pymysql", row.database),
-        "postgresql": ("postgresql+psycopg", row.database),
+        "sqlserver": ("mssql+pymssql", {"login_timeout": 5}),
+        "oracle": ("oracle+oracledb", {"tcp_connect_timeout": 5}),
+        "mysql": ("mysql+pymysql", {"connect_timeout": 5}),
+        "postgresql": ("postgresql+psycopg", {"connect_timeout": 5}),
     }
-    dialect, dbname = drivers[row.db_type]
-    url = URL.create(dialect, username=row.username, password=password, host=row.host, port=row.port, database=dbname)
+    dialect, connect_args = drivers[row.db_type]
+    url = URL.create(dialect, username=row.username, password=password, host=row.host, port=row.port, database=row.database)
     try:
-        test_engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+        test_engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         with test_engine.connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         test_engine.dispose()
