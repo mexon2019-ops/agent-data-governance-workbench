@@ -10,6 +10,8 @@ permissions:
 jobs:
   run-and-capture:
     runs-on: ubuntu-latest
+    env:
+      CI_ADMIN_PASSWORD: ${{ vars.CI_ADMIN_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
