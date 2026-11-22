@@ -51,12 +51,20 @@ def test_metadata_sync_is_repeatable_and_removes_stale_tables(monkeypatch):
             assert len(detail["columns"]) == 3
             assert next(c for c in detail["columns"] if c["column_name"] == "id")["is_primary_key"]
 
+            customer_column_ids_before = {
+                column.column_name: column.id for column in customer_table.columns
+            }
             second = main.sync_metadata(source.id, db)
             assert second["success"] is True
             assert second["table_count"] == 2
             assert len(db.scalars(
                 select(main.MetadataTable).where(main.MetadataTable.source_id == source.id)
             ).all()) == 2
+            db.refresh(customer_table)
+            customer_column_ids_after = {
+                column.column_name: column.id for column in customer_table.columns
+            }
+            assert customer_column_ids_after == customer_column_ids_before
 
             with source_engine.begin() as conn:
                 conn.exec_driver_sql("DROP TABLE orders")
