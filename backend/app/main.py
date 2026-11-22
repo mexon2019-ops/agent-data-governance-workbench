@@ -125,9 +125,37 @@ def db_session():
         db.close()
 
 
+def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
+    """Idempotently register the bundled Docker MySQL fixture when explicitly enabled."""
+    if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() not in {"1", "true", "yes"}:
+        return None
+    name = "MySQL 测试数据库（mes_test）"
+    row = db.scalar(select(DataSource).where(DataSource.name == name))
+    if row is not None:
+        return row
+    row = DataSource(
+        name=name,
+        db_type="mysql",
+        host=os.getenv("MYSQL_TEST_HOST", "mysql-test"),
+        port=int(os.getenv("MYSQL_TEST_PORT", "3306")),
+        database=os.getenv("MYSQL_TEST_DATABASE", "mes_test"),
+        username=os.getenv("MYSQL_TEST_USERNAME", "metadata_reader"),
+        password_env_key="MYSQL_TEST_READER_PASSWORD",
+        description="项目自带的虚构 LED 制造场景测试库；只读账号，仅用于元数据采集验证。",
+        status="待测试",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
+    if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() in {"1", "true", "yes"}:
+        with SessionLocal() as db:
+            ensure_mysql_test_datasource(db)
     yield
 
 
