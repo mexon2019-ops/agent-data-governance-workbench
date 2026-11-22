@@ -21,6 +21,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy import inspect as sa_inspect
+from .agent_service import run_governance_agent
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -537,8 +538,10 @@ async def audit_mutating_requests(request: Request, call_next):
             method = request.method
             if path.startswith("/api/v1/datasources"):
                 required = "datasource:manage"
-            elif (path.startswith("/api/v1/records") and method in {"POST", "PUT", "PATCH", "DELETE"}) or path == "/api/v1/agents/run":
+            elif (path.startswith("/api/v1/records") and method in {"POST", "PUT", "PATCH", "DELETE"}) :
                 required = "governance:write"
+            elif path == "/api/v1/agents/run":
+                required = "governance:read"
             elif path.startswith("/api/v1/datasources/") and (path.endswith("/test") or path.endswith("/sync")):
                 required = "datasource:manage"
             with SessionLocal() as permission_db:
@@ -1663,7 +1666,25 @@ def close_governance_issue(
 
 
 @app.post("/api/v1/agents/run")
-def agent_run(payload: AgentPrompt):
-    return {"status": "draft", "agent": "governance-assistant",
-            "reply": "已收到治理需求。当前版本先生成待审核建议；LangGraph 与模型网关将在后续版本接入。",
-            "input_length": len(payload.prompt), "requires_human_approval": True}
+def agent_run(
+    payload: AgentPrompt,
+    _user: User = Depends(require_permission("governance:read")),
+    db: Session = Depends(db_session),
+):
+    # Only aggregate counters are assembled here; no source connection details,
+    # metadata identifiers, business rows, or personal information enter model context.
+    context = {
+        "assets": db.scalar(select(func.count()).select_from(DataAsset)) or 0,
+        "standards": db.scalar(select(func.count()).select_from(DataStandard)) or 0,
+        "quality_rules": db.scalar(select(func.count()).select_from(QualityRule)) or 0,
+        "open_issues": db.scalar(select(func.count()).select_from(GovernanceIssue).where(
+            GovernanceIssue.status != "已关闭"
+        )) or 0,
+    }
+    result = run_governance_agent(payload.prompt, context)
+    return {
+        "status": "success",
+        "agent": "governance-assistant",
+        "context_scope": "aggregate_only",
+        **result,
+    }
