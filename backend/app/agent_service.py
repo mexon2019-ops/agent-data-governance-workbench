@@ -85,19 +85,30 @@ def _model_endpoint(base_url: str) -> str:
     return base if base.endswith("/chat/completions") else base + "/chat/completions"
 
 
-def run_governance_agent(prompt: str, context: dict[str, int]) -> dict[str, Any]:
+def run_governance_agent(
+    prompt: str,
+    context: dict[str, int],
+    allow_external_model: bool = False,
+) -> dict[str, Any]:
     sanitized = sanitize_prompt(prompt)
     api_key = os.getenv("LLM_API_KEY", "").strip()
     base_url = os.getenv("LLM_API_BASE_URL", "").strip()
     model = os.getenv("LLM_MODEL", "").strip()
-    if not (api_key and base_url and model):
+    def local_result(status: str, model_name: str | None = None) -> dict[str, Any]:
         return {
             "reply": local_governance_advice(sanitized, context),
-            "provider_status": "local_fallback",
-            "model": None,
+            "provider_status": status,
+            "model": model_name,
             "sanitized": True,
             "requires_human_approval": True,
         }
+
+    if not (api_key and base_url and model):
+        return local_result("local_fallback")
+    if os.getenv("LLM_EXTERNAL_ENABLED", "false").strip().lower() not in {"1", "true", "yes"}:
+        return local_result("external_disabled", model)
+    if not allow_external_model:
+        return local_result("consent_required", model)
 
     # This compact context intentionally contains aggregate counts only.
     system_message = (
