@@ -250,7 +250,10 @@ class QualityRun(Base):
 
 class GovernanceIssue(Base):
     __tablename__ = "governance_issues"
-    __table_args__ = (UniqueConstraint("issue_code", name="uq_governance_issue_code"),)
+    __table_args__ = (
+        UniqueConstraint("issue_code", name="uq_governance_issue_code"),
+        UniqueConstraint("quality_run_id", name="uq_governance_issue_quality_run"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     issue_code: Mapped[str] = mapped_column(String(80), index=True)
     quality_run_id: Mapped[int | None] = mapped_column(ForeignKey("quality_runs.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -642,8 +645,8 @@ def dashboard(db: Session = Depends(db_session)):
     counts["data_sources"] = db.scalar(select(func.count()).select_from(DataSource)) or 0
     counts["metadata_tables"] = db.scalar(select(func.count()).select_from(MetadataTable)) or 0
     counts["metadata_columns"] = db.scalar(select(func.count()).select_from(MetadataColumn)) or 0
-    counts["pending_tasks"] = db.scalar(select(func.count()).select_from(Record).where(
-        Record.category == "task", Record.status.in_(["待处理", "进行中", "草稿"]))) or 0
+    counts["pending_tasks"] = db.scalar(select(func.count()).select_from(GovernanceIssue).where(
+        GovernanceIssue.status != "已关闭")) or 0
     return counts
 
 
