@@ -60,3 +60,33 @@ def test_governance_api_requires_permission_and_audit_is_admin_only(monkeypatch)
             "status": "草稿", "owner": "test"
         })
         assert created.status_code == 201
+
+
+def test_viewer_role_cannot_write_or_manage_datasources(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("AUTH_SECRET", "test-only-secret-that-is-long-enough-for-ci-123456")
+    main.Base.metadata.create_all(main.engine)
+    with main.SessionLocal() as db:
+        main.bootstrap_auth(db)
+        viewer_role = db.query(main.Role).filter_by(name="viewer").one()
+        username = "viewer-rbac-test"
+        existing = db.query(main.User).filter_by(username=username).one_or_none()
+        if existing:
+            db.delete(existing)
+            db.commit()
+        viewer = main.User(username=username, password_hash=main.hash_password("viewer-password-123"),
+                           display_name="只读测试用户", roles=[viewer_role])
+        db.add(viewer)
+        db.commit()
+    with TestClient(main.app) as client:
+        login = client.post("/api/v1/auth/login", json={
+            "username": username, "password": "viewer-password-123"
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": "Bearer " + login.json()["access_token"]}
+        assert client.get("/api/v1/dashboard", headers=headers).status_code == 200
+        assert client.get("/api/v1/datasources", headers=headers).status_code == 403
+        denied = client.post("/api/v1/records", headers=headers, json={
+            "category": "asset", "name": "forbidden", "description": "", "status": "草稿", "owner": ""
+        })
+        assert denied.status_code == 403
