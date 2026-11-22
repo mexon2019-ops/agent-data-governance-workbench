@@ -152,7 +152,6 @@ def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(engine)
     if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() in {"1", "true", "yes"}:
         with SessionLocal() as db:
             ensure_mysql_test_datasource(db)
@@ -160,7 +159,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agent 数据治理工作台 API", version="0.3.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+allowed_origins = [origin.strip() for origin in os.getenv(
+    "CORS_ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173"
+).split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 @app.get("/health")
