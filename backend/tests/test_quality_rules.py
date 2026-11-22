@@ -106,6 +106,6 @@ def test_quality_rule_rejects_unsafe_or_invalid_configuration():
 
     with pytest.raises(Exception):
         main.QualityRuleIn(
-            rule_code="BAD", name="bad range", metadata_table_id=1, metadata_column_id=1,
-            rule_type="range", config={"min": 20, "max": 10},
+            rule_code="BAD", name="unsafe SQL", metadata_table_id=1, metadata_column_id=1,
+            rule_type="raw_sql", config={"sql": "DELETE FROM users"},
         )
