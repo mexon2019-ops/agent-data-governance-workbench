@@ -553,7 +553,9 @@ def health():
 @app.get("/api/v1/dashboard")
 def dashboard(db: Session = Depends(db_session)):
     counts = {c: db.scalar(select(func.count()).select_from(Record).where(Record.category == c)) or 0
-              for c in ["asset", "standard", "quality", "task"]}
+              for c in ["quality", "task"]}
+    counts["asset"] = db.scalar(select(func.count()).select_from(DataAsset)) or 0
+    counts["standard"] = db.scalar(select(func.count()).select_from(DataStandard)) or 0
     counts["data_sources"] = db.scalar(select(func.count()).select_from(DataSource)) or 0
     counts["metadata_tables"] = db.scalar(select(func.count()).select_from(MetadataTable)) or 0
     counts["metadata_columns"] = db.scalar(select(func.count()).select_from(MetadataColumn)) or 0
@@ -1026,12 +1028,25 @@ def get_data_standard(standard_id: int, db: Session = Depends(db_session)):
     if not row:
         raise HTTPException(404, "数据标准不存在")
     result = standard_public(row, include_versions=True)
-    result["mappings"] = [{
-        "id": mapping.id, "version_id": mapping.version_id,
-        "metadata_column_id": mapping.metadata_column_id,
-        "mapping_status": mapping.mapping_status, "note": mapping.note,
-        "mapped_at": mapping.mapped_at,
-    } for version in row.versions for mapping in version.mappings]
+    mappings = []
+    for version in row.versions:
+        for mapping in version.mappings:
+            column = db.get(MetadataColumn, mapping.metadata_column_id)
+            table = db.get(MetadataTable, column.table_id) if column else None
+            source = db.get(DataSource, table.source_id) if table else None
+            mappings.append({
+                "id": mapping.id, "version_id": mapping.version_id,
+                "version_number": version.version_number,
+                "metadata_column_id": mapping.metadata_column_id,
+                "source_name": source.name if source else "",
+                "schema_name": table.schema_name if table else "",
+                "table_name": table.table_name if table else "",
+                "column_name": column.column_name if column else "",
+                "data_type": column.data_type if column else "",
+                "mapping_status": mapping.mapping_status, "note": mapping.note,
+                "mapped_at": mapping.mapped_at,
+            })
+    result["mappings"] = mappings
     return result
 
 
@@ -1111,7 +1126,7 @@ def publish_standard_version(
     if version.version_number != row.current_version:
         raise HTTPException(409, "只能发布当前编辑版本")
     for old in row.versions:
-        if old.status == "已发布":
+        if old.id != version.id and old.status in {"已发布", "草稿"}:
             old.status = "已废止"
     version.status = "已发布"
     version.effective_at = datetime.utcnow()
