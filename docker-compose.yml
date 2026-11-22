@@ -17,9 +17,9 @@ services:
     image: mysql:8.0
     profiles: ["mysql-test"]
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_TEST_ROOT_PASSWORD:-local-only-change-this-root-password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_TEST_ROOT_PASSWORD:?Set MYSQL_TEST_ROOT_PASSWORD in .env}
       MYSQL_DATABASE: mes_test
-      MYSQL_TEST_READER_PASSWORD: ${MYSQL_TEST_READER_PASSWORD:-local-only-change-this-reader-password}
+      MYSQL_TEST_READER_PASSWORD: ${MYSQL_TEST_READER_PASSWORD:?Set MYSQL_TEST_READER_PASSWORD in .env}
     ports:
       - "127.0.0.1:3307:3306"
     volumes:
@@ -38,7 +38,12 @@ services:
       MES_DB_PASSWORD: ${MES_DB_PASSWORD:-}
       ORACLE_DB_PASSWORD: ${ORACLE_DB_PASSWORD:-}
       MYSQL_DB_PASSWORD: ${MYSQL_DB_PASSWORD:-}
-      MYSQL_TEST_READER_PASSWORD: ${MYSQL_TEST_READER_PASSWORD:-local-only-change-this-reader-password}
+      MYSQL_TEST_READER_PASSWORD: ${MYSQL_TEST_READER_PASSWORD:?Set MYSQL_TEST_READER_PASSWORD in .env}
+      AUTO_REGISTER_MYSQL_TEST_DATASOURCE: "true"
+      MYSQL_TEST_HOST: mysql-test
+      MYSQL_TEST_PORT: "3306"
+      MYSQL_TEST_DATABASE: mes_test
+      MYSQL_TEST_USERNAME: metadata_reader
       PG_DB_PASSWORD: ${PG_DB_PASSWORD:-}
     ports: ["8000:8000"]
     depends_on:
