@@ -37,3 +37,26 @@ def test_permission_roles_are_distinct():
         assert "governance:write" in roles["data_steward"]
         assert "audit:read" in roles["auditor"]
         assert "governance:write" not in roles["viewer"]
+
+
+def test_governance_api_requires_permission_and_audit_is_admin_only(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("AUTH_SECRET", "test-only-secret-that-is-long-enough-for-ci-123456")
+    monkeypatch.setenv("BOOTSTRAP_ADMIN_PASSWORD", "ci-bootstrap-password-123456")
+    main.Base.metadata.create_all(main.engine)
+    with TestClient(main.app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/api/v1/dashboard").status_code == 401
+        login = client.post("/api/v1/auth/login", json={
+            "username": "admin",
+            "password": "ci-bootstrap-password-123456",
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": "Bearer " + login.json()["access_token"]}
+        assert client.get("/api/v1/dashboard", headers=headers).status_code == 200
+        assert client.get("/api/v1/admin/audit-logs", headers=headers).status_code == 200
+        created = client.post("/api/v1/records", headers=headers, json={
+            "category": "asset", "name": "auth-protected-test", "description": "RBAC test",
+            "status": "草稿", "owner": "test"
+        })
+        assert created.status_code == 201
