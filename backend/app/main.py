@@ -1726,6 +1726,12 @@ def agent_run(
         "open_issues": db.scalar(select(func.count()).select_from(GovernanceIssue).where(
             GovernanceIssue.status != "已关闭"
         )) or 0,
+        "unclassified_columns": db.scalar(select(func.count()).select_from(MetadataColumn).where(
+            MetadataColumn.sensitivity_level == "未分级"
+        )) or 0,
+        "sensitive_columns": db.scalar(select(func.count()).select_from(MetadataColumn).where(
+            MetadataColumn.sensitivity_level.in_(["敏感", "高度敏感"])
+        )) or 0,
     }
     result = run_governance_agent(payload.prompt, context)
     return {
