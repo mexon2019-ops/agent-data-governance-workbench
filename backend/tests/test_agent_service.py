@@ -38,6 +38,7 @@ def test_external_model_receives_only_sanitized_prompt_and_aggregate_context(mon
     monkeypatch.setenv("LLM_API_KEY", "test-api-key")
     monkeypatch.setenv("LLM_API_BASE_URL", "https://llm.example.test/v1")
     monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_EXTERNAL_ENABLED", "true")
     captured = {}
 
     class Response(BytesIO):
@@ -60,6 +61,7 @@ def test_external_model_receives_only_sanitized_prompt_and_aggregate_context(mon
         "请分析质量问题，联系人:李四，电话 13912345678，token=private-token",
         {"assets": 3, "standards": 4, "quality_rules": 5, "open_issues": 1,
          "unclassified_columns": 6, "sensitive_columns": 2},
+        allow_external_model=True,
     )
 
     serialized = json.dumps(captured["body"], ensure_ascii=False)
@@ -73,3 +75,34 @@ def test_external_model_receives_only_sanitized_prompt_and_aggregate_context(mon
     assert result["sanitized"] is True
     assert result["requires_human_approval"] is True
     assert captured["url"] == "https://llm.example.test/v1/chat/completions"
+
+
+def test_external_model_requires_explicit_user_consent(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("LLM_API_BASE_URL", "https://llm.example.test/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_EXTERNAL_ENABLED", "true")
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("external model must not be called without user consent")
+
+    monkeypatch.setattr(agent_service.urllib.request, "urlopen", unexpected_call)
+    result = agent_service.run_governance_agent("请给出数据标准建议", {"assets": 1})
+    assert result["provider_status"] == "consent_required"
+    assert result["requires_human_approval"] is True
+
+
+def test_server_switch_can_block_external_model_even_with_user_consent(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("LLM_API_BASE_URL", "https://llm.example.test/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_EXTERNAL_ENABLED", "false")
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("server policy must block external model calls")
+
+    monkeypatch.setattr(agent_service.urllib.request, "urlopen", unexpected_call)
+    result = agent_service.run_governance_agent(
+        "请给出数据标准建议", {"assets": 1}, allow_external_model=True
+    )
+    assert result["provider_status"] == "external_disabled"

@@ -76,7 +76,7 @@ V0.3 先交付轻量元数据采集闭环；OpenMetadata 保留为下一阶段�
 ## Sprint 6：安全治理 Agent
 Agent 已接入本地治理建议服务和可选 OpenAI-compatible 模型网关。模型上下文只包含治理汇总计数，用户问题在外发前执行基础脱敏；Agent 只需要 governance:read，不读取源数据库业务明细，也不具备自动执行治理写操作的能力。未配置模型时自动使用本地规则建议。
 
-模型网关配置项：LLM_API_BASE_URL、LLM_API_KEY、LLM_MODEL、LLM_TIMEOUT_SECONDS。密钥只保存在服务器 .env 或 Docker secrets，不能提交仓库或暴露给前端。
+模型网关配置项：LLM_API_BASE_URL、LLM_API_KEY、LLM_MODEL、LLM_TIMEOUT_SECONDS。外部调用默认关闭，需服务器设置 LLM_EXTERNAL_ENABLED=true，并由用户每次提问时明确勾选外发确认。密钥只保存在服务器 .env 或 Docker secrets，不能提交仓库或暴露给前端。详见 [Sprint 8 外部模型双重授权](docs/SPRINT-8-LLM-OUTBOUND-CONSENT.md)。
 
 详细配置、安全边界和验收标准见 [Sprint 6 安全治理 Agent](docs/SPRINT-6-SAFE-GOVERNANCE-AGENT.md)。基础脱敏不等同于完整 DLP；生产环境启用外部模型前，仍需企业数据分类分级、敏感实体词典、外发审批和模型供应商合规评估。
 
