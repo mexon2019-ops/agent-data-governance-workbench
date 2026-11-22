@@ -1,23 +1,71 @@
-name: CI
+name: Runtime smoke test and screenshots
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  frontend:
+  run-and-capture:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: cd frontend && npm install && npm run build
-  backend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m compileall backend/app
+      - name: Install backend dependencies
+        run: pip install fastapi==0.115.12 uvicorn==0.34.2 SQLAlchemy==2.0.40
+      - name: Start backend
+        run: |
+          cd backend
+          nohup env DATABASE_URL=sqlite:////tmp/governance-smoke.db uvicorn app.main:app --host 127.0.0.1 --port 8000 >/tmp/backend.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health && break || sleep 2; done
+      - name: Install frontend and browser
+        run: |
+          cd frontend
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Start frontend
+        run: |
+          cd frontend
+          nohup npm run dev -- --host 127.0.0.1 >/tmp/frontend.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:5173 >/dev/null && break || sleep 2; done
+      - name: Capture real browser screenshots and smoke-test pages
+        run: |
+          cd frontend
+          mkdir -p ../artifacts
+          cat > smoke.cjs <<'EOF'
+          const { chromium } = require('playwright');
+          (async () => {
+            const browser = await chromium.launch({headless:true});
+            const page = await browser.newPage({viewport:{width:1440,height:1000},deviceScaleFactor:1});
+            const errors=[];
+            page.on('pageerror',e=>errors.push(e.message));
+            await page.goto('http://127.0.0.1:5173',{waitUntil:'networkidle'});
+            await page.screenshot({path:'../artifacts/01-dashboard.png',fullPage:true});
+            const labels=['数据源管理','数据资产','元数据目录','数据标准','数据质量','治理任务','Agent 助手'];
+            for(let i=0;i<labels.length;i++){
+              await page.getByRole('button',{name:new RegExp(labels[i])}).first().click();
+              await page.waitForTimeout(350);
+              await page.screenshot({path:'../artifacts/0'+(i+2)+'-'+['sources','assets','catalog','standards','quality','tasks','agent'][i]+'.png',fullPage:true});
+            }
+            await page.getByRole('button',{name:/新增数据源/}).click();
+            await page.screenshot({path:'../artifacts/09-source-create-modal.png',fullPage:true});
+            const health=await page.request.get('http://127.0.0.1:8000/health');
+            const dashboard=await page.request.get('http://127.0.0.1:8000/api/v1/dashboard');
+            const results={health:health.status(),dashboard:dashboard.status(),pageErrors:errors};
+            require('fs').writeFileSync('../artifacts/smoke-results.json',JSON.stringify(results,null,2));
+            await browser.close();
+            if(health.status()!==200||dashboard.status()!==200||errors.length) process.exit(1);
+          })().catch(e=>{console.error(e);process.exit(1)});
+          EOF
+          node smoke.cjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workbench-real-browser-screenshots
+          path: artifacts/
+          retention-days: 14
