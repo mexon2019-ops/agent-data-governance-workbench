@@ -25,7 +25,7 @@ def test_metadata_sync_is_repeatable_and_removes_stale_tables(monkeypatch):
         with main.SessionLocal() as db:
             source = main.DataSource(
                 name="fixture-mysql",
-                db_type="mysql",
+                db_type="sqlite",
                 host="localhost",
                 port=3306,
                 database="fixture",
@@ -74,3 +74,54 @@ def test_metadata_sync_is_repeatable_and_removes_stale_tables(monkeypatch):
             assert all(run.status == "成功" and run.finished_at is not None for run in runs)
     finally:
         source_engine.dispose()
+
+
+def test_mysql_sync_is_scoped_to_configured_database(monkeypatch):
+    main.Base.metadata.create_all(main.engine)
+
+    class FakeInspector:
+        seen_schemas = []
+
+        def get_table_names(self, schema=None):
+            self.seen_schemas.append(schema)
+            return ["only_this_database"]
+
+        def get_view_names(self, schema=None):
+            return []
+
+        def get_columns(self, table_name, schema=None):
+            return [{"name": "id", "type": "INTEGER", "nullable": False, "default": None, "ordinal": 1}]
+
+        def get_pk_constraint(self, table_name, schema=None):
+            return {"constrained_columns": ["id"]}
+
+        def get_foreign_keys(self, table_name, schema=None):
+            return []
+
+        def get_table_comment(self, table_name, schema=None):
+            return {"text": "fixture table"}
+
+    inspector = FakeInspector()
+    with main.SessionLocal() as db:
+        source = main.DataSource(
+            name="mysql-scope-test",
+            db_type="mysql",
+            host="mysql.internal",
+            port=3306,
+            database="mes_quality",
+            username="metadata_reader",
+            password_env_key="MYSQL_DB_PASSWORD",
+        )
+        db.add(source)
+        db.commit()
+        db.refresh(source)
+        monkeypatch.setattr(main, "build_source_engine", lambda _row: object())
+        monkeypatch.setattr(main, "sa_inspect", lambda _engine: inspector)
+
+        result = main.sync_metadata(source.id, db)
+
+        assert result["success"] is True
+        assert result["table_count"] == 1
+        assert inspector.seen_schemas == ["mes_quality"]
+        saved = db.scalar(select(main.MetadataTable).where(main.MetadataTable.source_id == source.id))
+        assert saved.schema_name == "mes_quality"
