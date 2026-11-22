@@ -1,14 +1,20 @@
 import os
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import uuid4
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint,
     create_engine, select, func, delete
 )
 from sqlalchemy.engine import URL
@@ -23,6 +29,35 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 class Base(DeclarativeBase):
     pass
 
+
+user_roles = Table("user_roles", Base.metadata,
+    Column("user_id", ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("role_id", ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True))
+role_permissions = Table("role_permissions", Base.metadata,
+    Column("role_id", ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True),
+    Column("permission_id", ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True))
+class Role(Base):
+    __tablename__ = "roles"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    description: Mapped[str] = mapped_column(String(255), default="")
+    permissions: Mapped[list["Permission"]] = relationship(secondary=role_permissions, back_populates="roles")
+    users: Mapped[list["User"]] = relationship(secondary=user_roles, back_populates="roles")
+class Permission(Base):
+    __tablename__ = "permissions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    description: Mapped[str] = mapped_column(String(255), default="")
+    roles: Mapped[list[Role]] = relationship(secondary=role_permissions, back_populates="permissions")
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    roles: Mapped[list[Role]] = relationship(secondary=user_roles, back_populates="users")
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
@@ -107,6 +142,15 @@ class MetadataSyncRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+
+class LoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=256)
+class UserCreateIn(BaseModel):
+    username: str = Field(min_length=3, max_length=80, pattern="^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=12, max_length=256)
+    display_name: str = Field(default="", max_length=120)
+    roles: list[str] = Field(default_factory=lambda: ["viewer"])
 
 class RecordIn(BaseModel):
     category: str = Field(min_length=1, max_length=40)
