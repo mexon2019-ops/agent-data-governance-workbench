@@ -59,3 +59,54 @@ V0.3 先交付轻量元数据采集闭环；OpenMetadata 保留为下一阶段�
 - Agent 尚未接入 LangGraph 或外部模型；当前不会将提示词发送给第三方。
 - 当前尚无完整登录、RBAC、审批、审计、字段级脱敏和生产级密钥托管；不得直接暴露公网或直接用于生产数据治理。
 - 四种源数据库的驱动依赖、网络、TLS、Oracle service name/SID、SQL Server 实例及权限仍需在目标内网环境做真实联调。
+
+## MySQL 测试库（可选）
+
+仓库提供一个隔离的 MySQL 8.0 测试库，包含虚构的 LED 封装制造场景数据结构：生产线、物料、设备、生产订单、质量检验、不良记录，以及一个视图。所有样例数据均为虚构，不包含企业真实数据。
+
+### 启动
+
+先复制并编辑环境变量文件，至少修改 PostgreSQL、MySQL root 和只读账号密码：
+
+```bash
+cp .env.example .env
+```
+
+启动测试 MySQL：
+
+```bash
+docker compose --profile mysql-test up -d mysql-test
+docker compose ps
+docker compose logs -f mysql-test
+```
+
+MySQL 仅绑定宿主机回环地址 `127.0.0.1:3307`，不会默认暴露到局域网。若工作台后端也运行在同一 Docker Compose 网络中，数据源连接应填写：
+
+| 配置 | 值 |
+|---|---|
+| 类型 | MySQL |
+| 主机 | mysql-test |
+| 端口 | 3306 |
+| 数据库 | mes_test |
+| 用户 | metadata_reader |
+| 密码环境变量名 | MYSQL_TEST_READER_PASSWORD |
+
+在工作台“数据源管理”创建数据源，密码环境变量名填 `MYSQL_TEST_READER_PASSWORD`，然后测试连接并采集元数据。
+
+如果从宿主机上的数据库客户端连接，使用 `127.0.0.1:3307`，用户名 `metadata_reader` 和 `.env` 中配置的只读密码。
+
+### 测试账号权限
+
+初始化脚本创建 `metadata_reader`，仅授予 `mes_test.*` 上的 `SELECT`、`SHOW VIEW` 权限。采集程序只调用元数据 Inspector，不读取业务表数据行。不要把此测试容器改成生产数据库，也不要将端口改为公网或不受控网段可访问。
+
+### 重置测试库
+
+以下操作会删除该测试 MySQL 的 Docker 数据卷及其中所有测试数据，请确认只用于本测试库：
+
+```bash
+docker compose --profile mysql-test down
+docker volume rm agent-data-governance-workbench_mysqltestdata
+docker compose --profile mysql-test up -d mysql-test
+```
+
+如项目目录名不同，实际卷名可能不同，可先用 `docker volume ls` 确认。真实密码只保存在本机 `.env`，不要提交到 Git。
