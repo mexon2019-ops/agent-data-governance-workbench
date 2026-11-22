@@ -297,9 +297,8 @@ def ensure_mysql_test_datasource(db: Session) -> DataSource | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if os.getenv("BOOTSTRAP_ADMIN_PASSWORD"):
-        with SessionLocal() as auth_db:
-            bootstrap_auth(auth_db)
+    with SessionLocal() as auth_db:
+        bootstrap_auth(auth_db)
     if os.getenv("AUTO_REGISTER_MYSQL_TEST_DATASOURCE", "").lower() in {"1", "true", "yes"}:
         with SessionLocal() as db:
             ensure_mysql_test_datasource(db)
