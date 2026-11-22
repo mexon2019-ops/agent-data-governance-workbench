@@ -69,6 +69,10 @@ API：
 ## OpenMetadata 集成策略
 V0.3 先交付轻量元数据采集闭环；OpenMetadata 保留为下一阶段的增强治理引擎，用于扩展统一元数据服务、血缘、治理工作流和更多连接器。官方连接器支持 PostgreSQL、MySQL、Oracle、SQL Server。生产部署需单独评估数据库、搜索引擎和 Ingestion 服务的资源与运维成本，不直接把 Quickstart 组件未经评估地并入企业生产环境。
 
+## Sprint 7：字段级分类分级
+
+元数据字段详情支持敏感级别人工确认，提供基于字段名称的规则建议，并记录分类依据、确认人和时间。建议规则不读取源数据库业务数据行；Agent 仅接收未分级字段数、敏感字段数等聚合统计，不接收字段名称或明细。详见 [Sprint 7 字段分类分级](docs/SPRINT-7-FIELD-CLASSIFICATION.md)。
+
 ## Sprint 6：安全治理 Agent
 Agent 已接入本地治理建议服务和可选 OpenAI-compatible 模型网关。模型上下文只包含治理汇总计数，用户问题在外发前执行基础脱敏；Agent 只需要 governance:read，不读取源数据库业务明细，也不具备自动执行治理写操作的能力。未配置模型时自动使用本地规则建议。
 

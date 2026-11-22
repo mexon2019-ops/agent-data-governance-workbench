@@ -22,6 +22,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy import inspect as sa_inspect
 from .agent_service import run_governance_agent
+from .classification_service import suggest_field_classification
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -130,6 +131,10 @@ class MetadataColumn(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     is_primary_key: Mapped[bool] = mapped_column(Boolean, default=False)
     is_foreign_key: Mapped[bool] = mapped_column(Boolean, default=False)
+    sensitivity_level: Mapped[str] = mapped_column(String(30), default="未分级")
+    classification_basis: Mapped[str] = mapped_column(Text, default="")
+    classified_by: Mapped[str] = mapped_column(String(80), default="")
+    classified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     table: Mapped[MetadataTable] = relationship(back_populates="columns")
 
 
@@ -304,6 +309,10 @@ class DataSourceIn(BaseModel):
 
 class AgentPrompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
+
+class MetadataColumnClassificationIn(BaseModel):
+    sensitivity_level: str = Field(pattern="^(未分级|公开|内部|敏感|高度敏感)$")
+    classification_basis: str = Field(default="", max_length=1000)
 
 class DataAssetIn(BaseModel):
     asset_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_.-]+$")
@@ -821,6 +830,10 @@ def get_metadata_table(table_id: int, db: Session = Depends(db_session)):
             "nullable": column.nullable, "default_value": column.default_value,
             "ordinal_position": column.ordinal_position, "description": column.description,
             "is_primary_key": column.is_primary_key, "is_foreign_key": column.is_foreign_key,
+            "sensitivity_level": column.sensitivity_level,
+            "classification_basis": column.classification_basis,
+            "classified_by": column.classified_by,
+            "classified_at": column.classified_at,
             "standard_mappings": [{
                 "mapping_id": mapping.id, "standard_id": standard.id,
                 "standard_code": standard.standard_code, "standard_name": standard.name,
@@ -831,6 +844,39 @@ def get_metadata_table(table_id: int, db: Session = Depends(db_session)):
     return {
         **table_public(row, source.name if source else ""),
         "columns": columns,
+    }
+
+
+@app.get("/api/v1/metadata/columns/{column_id}/classification-suggestion")
+def get_metadata_column_classification_suggestion(column_id: int, db: Session = Depends(db_session)):
+    column = db.get(MetadataColumn, column_id)
+    if not column:
+        raise HTTPException(404, "元数据字段不存在")
+    return suggest_field_classification(column.column_name, column.data_type)
+
+
+@app.patch("/api/v1/metadata/columns/{column_id}/classification")
+def classify_metadata_column(
+    column_id: int,
+    payload: MetadataColumnClassificationIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    column = db.get(MetadataColumn, column_id)
+    if not column:
+        raise HTTPException(404, "元数据字段不存在")
+    column.sensitivity_level = payload.sensitivity_level
+    column.classification_basis = payload.classification_basis.strip()
+    column.classified_by = _user.username
+    column.classified_at = datetime.utcnow()
+    db.commit()
+    db.refresh(column)
+    return {
+        "id": column.id,
+        "sensitivity_level": column.sensitivity_level,
+        "classification_basis": column.classification_basis,
+        "classified_by": column.classified_by,
+        "classified_at": column.classified_at,
     }
 
 
@@ -1679,6 +1725,12 @@ def agent_run(
         "quality_rules": db.scalar(select(func.count()).select_from(QualityRule)) or 0,
         "open_issues": db.scalar(select(func.count()).select_from(GovernanceIssue).where(
             GovernanceIssue.status != "已关闭"
+        )) or 0,
+        "unclassified_columns": db.scalar(select(func.count()).select_from(MetadataColumn).where(
+            MetadataColumn.sensitivity_level == "未分级"
+        )) or 0,
+        "sensitive_columns": db.scalar(select(func.count()).select_from(MetadataColumn).where(
+            MetadataColumn.sensitivity_level.in_(["敏感", "高度敏感"])
         )) or 0,
     }
     result = run_governance_agent(payload.prompt, context)

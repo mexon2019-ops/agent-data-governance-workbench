@@ -73,7 +73,9 @@ def local_governance_advice(prompt: str, context: dict[str, int]) -> str:
         + f"数据资产 {context.get('assets', 0)} 项，"
         + f"数据标准 {context.get('standards', 0)} 项，"
         + f"质量规则 {context.get('quality_rules', 0)} 项，"
-        + f"未关闭治理问题 {context.get('open_issues', 0)} 项。"
+        + f"未关闭治理问题 {context.get('open_issues', 0)} 项，"
+        + f"未分级字段 {context.get('unclassified_columns', 0)} 个，"
+        + f"敏感及高度敏感字段 {context.get('sensitive_columns', 0)} 个。"
         + "\n以上为治理建议，不代表已执行任何变更；请业务负责人确认后再实施。"
     )
 
@@ -112,6 +114,8 @@ def run_governance_agent(prompt: str, context: dict[str, int]) -> dict[str, Any]
             "standard_count": int(context.get("standards", 0)),
             "quality_rule_count": int(context.get("quality_rules", 0)),
             "open_issue_count": int(context.get("open_issues", 0)),
+            "unclassified_column_count": int(context.get("unclassified_columns", 0)),
+            "sensitive_column_count": int(context.get("sensitive_columns", 0)),
         },
     }
     body = json.dumps({
