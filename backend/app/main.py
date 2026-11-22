@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint,
+    Boolean, Column, DateTime, ForeignKey, Integer, Float, String, Table, Text, UniqueConstraint,
     create_engine, select, func, delete, MetaData, Table, and_, or_, cast
 )
 from sqlalchemy.engine import URL
@@ -598,6 +598,7 @@ def dashboard(db: Session = Depends(db_session)):
               for c in ["quality", "task"]}
     counts["asset"] = db.scalar(select(func.count()).select_from(DataAsset)) or 0
     counts["standard"] = db.scalar(select(func.count()).select_from(DataStandard)) or 0
+    counts["quality"] = db.scalar(select(func.count()).select_from(QualityRule)) or 0
     counts["data_sources"] = db.scalar(select(func.count()).select_from(DataSource)) or 0
     counts["metadata_tables"] = db.scalar(select(func.count()).select_from(MetadataTable)) or 0
     counts["metadata_columns"] = db.scalar(select(func.count()).select_from(MetadataColumn)) or 0
