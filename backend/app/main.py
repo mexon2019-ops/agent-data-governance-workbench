@@ -4,7 +4,11 @@ from datetime import datetime
 from uuid import uuid4
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+import jwt
+from jwt import InvalidTokenError
+from pwdlib import PasswordHash
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -22,6 +26,43 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 class Base(DeclarativeBase):
     pass
+
+
+class Role(Base):
+    __tablename__ = "roles"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(Text, default="")
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Permission(Base):
+    __tablename__ = "permissions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    resource: Mapped[str] = mapped_column(String(100))
+    action: Mapped[str] = mapped_column(String(40))
+
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+    __table_args__ = (UniqueConstraint("role_id", "permission_id", name="uq_role_permission"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id", ondelete="CASCADE"), index=True)
+    permission_id: Mapped[int] = mapped_column(ForeignKey("permissions.id", ondelete="CASCADE"), index=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class AuditLog(Base):
@@ -108,6 +149,14 @@ class MetadataSyncRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class UserPublic(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    is_active: bool
+    role: str
+
+
 class RecordIn(BaseModel):
     category: str = Field(min_length=1, max_length=40)
     name: str = Field(min_length=1, max_length=180)
@@ -172,7 +221,85 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Agent 数据治理工作台 API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Agent 数据治理工作台 API", version="0.4.0", lifespan=lifespan)
+
+password_hash = PasswordHash.recommended()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+
+
+def get_jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET_KEY", "")
+    if len(secret) < 32:
+        raise HTTPException(status_code=503, detail="服务端 JWT_SECRET_KEY 未配置或长度不足 32 位")
+    return secret
+
+
+def get_current_user(token: str | None = Depends(oauth2_scheme), db: Session = Depends(db_session)):
+    if not token:
+        raise HTTPException(status_code=401, detail="请先登录", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        user_id = int(payload.get("sub", "0"))
+    except (InvalidTokenError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="登录凭证无效或已过期", headers={"WWW-Authenticate": "Bearer"})
+    user = db.get(User, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="用户不存在或已停用")
+    return user
+
+
+def require_permission(permission_code: str):
+    def checker(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+        stmt = select(Permission.code).join(RolePermission, RolePermission.permission_id == Permission.id).where(
+            RolePermission.role_id == user.role_id, Permission.code == permission_code
+        )
+        if db.scalar(stmt) is None:
+            raise HTTPException(status_code=403, detail="当前角色没有此操作权限")
+        return user
+    return checker
+
+
+@app.post("/api/v1/auth/token")
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(db_session)):
+    user = db.scalar(select(User).where(User.username == form.username))
+    if not user or not user.is_active or not password_hash.verify(form.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误", headers={"WWW-Authenticate": "Bearer"})
+    token = jwt.encode(
+        {"sub": str(user.id), "username": user.username,
+         "exp": datetime.utcnow().timestamp() + JWT_EXPIRE_MINUTES * 60},
+        get_jwt_secret(), algorithm=JWT_ALGORITHM
+    )
+    return {"access_token": token, "token_type": "bearer", "expires_in": JWT_EXPIRE_MINUTES * 60}
+
+
+@app.get("/api/v1/auth/me")
+def auth_me(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+    role = db.get(Role, user.role_id)
+    permission_stmt = select(Permission.code).join(
+        RolePermission, RolePermission.permission_id == Permission.id
+    ).where(RolePermission.role_id == user.role_id)
+    return {"id": user.id, "username": user.username, "display_name": user.display_name,
+            "is_active": user.is_active, "role": role.code if role else "",
+            "permissions": list(db.scalars(permission_stmt).all())}
+
+
+@app.get("/api/v1/admin/roles")
+def list_roles(user: User = Depends(require_permission("iam:role:read")),
+               db: Session = Depends(db_session)):
+    rows = db.scalars(select(Role).order_by(Role.id)).all()
+    return [{"id": r.id, "code": r.code, "name": r.name, "description": r.description}
+            for r in rows]
+
+
+@app.get("/api/v1/admin/users")
+def list_users(user: User = Depends(require_permission("iam:user:read")),
+               db: Session = Depends(db_session)):
+    rows = db.scalars(select(User).order_by(User.id)).all()
+    return [{"id": u.id, "username": u.username, "display_name": u.display_name,
+             "is_active": u.is_active, "role_id": u.role_id} for u in rows]
+
 allowed_origins = [origin.strip() for origin in os.getenv(
     "CORS_ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173"
 ).split(",") if origin.strip()]
