@@ -898,6 +898,42 @@ def classify_metadata_column(
     }
 
 
+@app.get("/api/v1/metadata/lineage")
+def list_metadata_lineage(
+    source_id: int | None = None,
+    table_id: int | None = None,
+    db: Session = Depends(db_session),
+):
+    stmt = (
+        select(MetadataLineage, MetadataTable, MetadataColumn, DataSource.name)
+        .join(MetadataTable, MetadataLineage.source_table_id == MetadataTable.id)
+        .join(MetadataColumn, MetadataLineage.source_column_id == MetadataColumn.id)
+        .join(DataSource, MetadataTable.source_id == DataSource.id)
+    )
+    if source_id is not None:
+        stmt = stmt.where(MetadataTable.source_id == source_id)
+    if table_id is not None:
+        stmt = stmt.where(MetadataTable.id == table_id)
+    rows = db.execute(stmt.order_by(
+        DataSource.name, MetadataTable.schema_name, MetadataTable.table_name,
+        MetadataColumn.column_name,
+    )).all()
+    return [{
+        "id": edge.id,
+        "source_id": table.source_id,
+        "source_name": source_name,
+        "source_schema": table.schema_name,
+        "source_table": table.table_name,
+        "source_column": column.column_name,
+        "target_schema": edge.target_schema_name,
+        "target_table": edge.target_table_name,
+        "target_column": edge.target_column_name,
+        "relation_type": edge.relation_type,
+        "discovery_method": edge.discovery_method,
+        "discovered_at": edge.discovered_at,
+    } for edge, table, column, source_name in rows]
+
+
 @app.get("/api/v1/datasources/{source_id}/sync-runs")
 def list_sync_runs(source_id: int, db: Session = Depends(db_session)):
     if not db.get(DataSource, source_id):
