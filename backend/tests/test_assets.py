@@ -15,6 +15,13 @@ def test_data_asset_catalog_create_filter_and_update():
             db.delete(existing)
             db.commit()
 
+        old_source = db.scalar(select(main.DataSource).where(main.DataSource.name == "asset-catalog-fixture"))
+        if old_source:
+            old_tables = db.scalars(select(main.MetadataTable).where(main.MetadataTable.source_id == old_source.id)).all()
+            for old_table in old_tables:
+                db.delete(old_table)
+            db.delete(old_source)
+            db.commit()
         source = main.DataSource(
             name="asset-catalog-fixture",
             db_type="mysql",
