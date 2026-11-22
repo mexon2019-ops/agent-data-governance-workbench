@@ -248,6 +248,30 @@ class QualityRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+class GovernanceIssue(Base):
+    __tablename__ = "governance_issues"
+    __table_args__ = (
+        UniqueConstraint("issue_code", name="uq_governance_issue_code"),
+        UniqueConstraint("quality_run_id", name="uq_governance_issue_quality_run"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    issue_code: Mapped[str] = mapped_column(String(80), index=True)
+    quality_run_id: Mapped[int | None] = mapped_column(ForeignKey("quality_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    rule_id: Mapped[int | None] = mapped_column(ForeignKey("quality_rules.id", ondelete="SET NULL"), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(180))
+    description: Mapped[str] = mapped_column(Text, default="")
+    severity: Mapped[str] = mapped_column(String(20), default="中")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    owner: Mapped[str] = mapped_column(String(100), default="")
+    status: Mapped[str] = mapped_column(String(30), default="待分派")
+    due_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    remediation_note: Mapped[str] = mapped_column(Text, default="")
+    review_note: Mapped[str] = mapped_column(Text, default="")
+    last_recheck_run_id: Mapped[int | None] = mapped_column(ForeignKey("quality_runs.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
 
 class LoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=80)
@@ -333,6 +357,25 @@ class QualityRuleIn(BaseModel):
     severity: str = Field(default="中", pattern="^(低|中|高)$")
     threshold_rate: float = Field(default=100.0, ge=0, le=100)
     config: dict[str, Any] = Field(default_factory=dict)
+
+class GovernanceIssueCreateIn(BaseModel):
+    quality_run_id: int
+    title: str = Field(min_length=1, max_length=180)
+    description: str = Field(default="", max_length=4000)
+    severity: str = Field(default="中", pattern="^(低|中|高)$")
+    owner_department: str = Field(default="", max_length=120)
+    owner: str = Field(default="", max_length=100)
+    due_date: datetime | None = None
+
+
+class GovernanceIssueAssignIn(BaseModel):
+    owner_department: str = Field(min_length=1, max_length=120)
+    owner: str = Field(min_length=1, max_length=100)
+    due_date: datetime | None = None
+
+
+class GovernanceIssueRemediationIn(BaseModel):
+    remediation_note: str = Field(min_length=1, max_length=4000)
 
 
 def db_session():
@@ -602,8 +645,8 @@ def dashboard(db: Session = Depends(db_session)):
     counts["data_sources"] = db.scalar(select(func.count()).select_from(DataSource)) or 0
     counts["metadata_tables"] = db.scalar(select(func.count()).select_from(MetadataTable)) or 0
     counts["metadata_columns"] = db.scalar(select(func.count()).select_from(MetadataColumn)) or 0
-    counts["pending_tasks"] = db.scalar(select(func.count()).select_from(Record).where(
-        Record.category == "task", Record.status.in_(["待处理", "进行中", "草稿"]))) or 0
+    counts["pending_tasks"] = db.scalar(select(func.count()).select_from(GovernanceIssue).where(
+        GovernanceIssue.status != "已关闭")) or 0
     return counts
 
 
@@ -1429,6 +1472,179 @@ def list_quality_runs(rule_id: int, db: Session = Depends(db_session)):
         "pass_rate": row.pass_rate, "passed": row.passed, "message": row.message,
         "started_at": row.started_at, "finished_at": row.finished_at,
     } for row in rows]
+
+
+
+def issue_public(row: GovernanceIssue):
+    return {
+        "id": row.id, "issue_code": row.issue_code, "quality_run_id": row.quality_run_id,
+        "rule_id": row.rule_id, "title": row.title, "description": row.description,
+        "severity": row.severity, "owner_department": row.owner_department, "owner": row.owner,
+        "status": row.status, "due_date": row.due_date, "remediation_note": row.remediation_note,
+        "review_note": row.review_note, "last_recheck_run_id": row.last_recheck_run_id,
+        "created_at": row.created_at, "updated_at": row.updated_at, "closed_at": row.closed_at,
+    }
+
+
+@app.get("/api/v1/issues")
+def list_governance_issues(
+    keyword: str | None = None,
+    status: str | None = None,
+    owner_department: str | None = None,
+    db: Session = Depends(db_session),
+):
+    stmt = select(GovernanceIssue).order_by(GovernanceIssue.updated_at.desc(), GovernanceIssue.id.desc())
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        stmt = stmt.where(GovernanceIssue.issue_code.ilike(like) | GovernanceIssue.title.ilike(like) |
+                          GovernanceIssue.description.ilike(like) | GovernanceIssue.owner.ilike(like))
+    if status:
+        stmt = stmt.where(GovernanceIssue.status == status)
+    if owner_department:
+        stmt = stmt.where(GovernanceIssue.owner_department == owner_department)
+    return [issue_public(row) for row in db.scalars(stmt).all()]
+
+
+@app.post("/api/v1/issues", status_code=201)
+def create_governance_issue(
+    payload: GovernanceIssueCreateIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    run = db.get(QualityRun, payload.quality_run_id)
+    if not run or run.status != "成功":
+        raise HTTPException(404, "有效的质量检测记录不存在")
+    if run.failed_count <= 0:
+        raise HTTPException(409, "检测结果没有异常记录，无需创建治理问题")
+    rule = db.get(QualityRule, run.rule_id)
+    if not rule:
+        raise HTTPException(409, "质量规则已不存在")
+    row = GovernanceIssue(
+        issue_code="GOV-" + uuid4().hex[:10].upper(),
+        quality_run_id=run.id, rule_id=rule.id,
+        title=payload.title, description=payload.description,
+        severity=payload.severity, owner_department=payload.owner_department,
+        owner=payload.owner, due_date=payload.due_date,
+        status="待分派",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return issue_public(row)
+
+
+@app.get("/api/v1/issues/{issue_id}")
+def get_governance_issue(issue_id: int, db: Session = Depends(db_session)):
+    row = db.get(GovernanceIssue, issue_id)
+    if not row:
+        raise HTTPException(404, "治理问题不存在")
+    result = issue_public(row)
+    if row.quality_run_id:
+        original = db.get(QualityRun, row.quality_run_id)
+        result["original_run"] = {
+            "total_count": original.total_count, "failed_count": original.failed_count,
+            "pass_rate": original.pass_rate,
+        } if original else None
+    if row.last_recheck_run_id:
+        recheck = db.get(QualityRun, row.last_recheck_run_id)
+        result["last_recheck"] = {
+            "total_count": recheck.total_count, "failed_count": recheck.failed_count,
+            "pass_rate": recheck.pass_rate, "status": recheck.status,
+        } if recheck else None
+    return result
+
+
+@app.patch("/api/v1/issues/{issue_id}/assign")
+def assign_governance_issue(
+    issue_id: int,
+    payload: GovernanceIssueAssignIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(GovernanceIssue, issue_id)
+    if not row:
+        raise HTTPException(404, "治理问题不存在")
+    if row.status in {"待关闭", "已关闭"}:
+        raise HTTPException(409, "问题已进入关闭阶段，不能重新分派")
+    row.owner_department = payload.owner_department
+    row.owner = payload.owner
+    row.due_date = payload.due_date
+    row.status = "整改中"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return issue_public(row)
+
+
+@app.patch("/api/v1/issues/{issue_id}/remediation")
+def submit_issue_remediation(
+    issue_id: int,
+    payload: GovernanceIssueRemediationIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(GovernanceIssue, issue_id)
+    if not row:
+        raise HTTPException(404, "治理问题不存在")
+    if row.status != "整改中" or not row.owner:
+        raise HTTPException(409, "请先分派责任人，再提交整改说明")
+    row.remediation_note = payload.remediation_note
+    row.status = "待复测"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return issue_public(row)
+
+
+@app.post("/api/v1/issues/{issue_id}/recheck")
+def recheck_governance_issue(
+    issue_id: int,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(GovernanceIssue, issue_id)
+    if not row:
+        raise HTTPException(404, "治理问题不存在")
+    if row.status != "待复测" or not row.rule_id:
+        raise HTTPException(409, "问题必须处于待复测状态")
+    result = run_quality_rule(row.rule_id, db)
+    row = db.get(GovernanceIssue, issue_id)
+    row.last_recheck_run_id = result.get("id")
+    if result.get("status") == "成功" and result.get("failed_count") == 0:
+        row.status = "待关闭"
+        row.review_note = "复测通过：异常记录数为 0，等待治理负责人确认关闭。"
+    elif result.get("status") == "成功":
+        row.status = "整改中"
+        row.review_note = "复测未通过：仍存在 " + str(result.get("failed_count", 0)) + " 条异常记录。"
+    else:
+        row.status = "整改中"
+        row.review_note = "复测执行失败：" + str(result.get("message", "请检查数据源连接和权限。") )
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return {**issue_public(row), "recheck_result": result}
+
+
+@app.post("/api/v1/issues/{issue_id}/close")
+def close_governance_issue(
+    issue_id: int,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(GovernanceIssue, issue_id)
+    if not row:
+        raise HTTPException(404, "治理问题不存在")
+    if row.status != "待关闭" or not row.last_recheck_run_id:
+        raise HTTPException(409, "问题尚未复测通过，不能关闭")
+    recheck = db.get(QualityRun, row.last_recheck_run_id)
+    if not recheck or recheck.status != "成功" or recheck.failed_count != 0:
+        raise HTTPException(409, "最近一次复测仍有异常，不能关闭")
+    row.status = "已关闭"
+    row.closed_at = datetime.utcnow()
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return issue_public(row)
 
 
 @app.post("/api/v1/agents/run")
