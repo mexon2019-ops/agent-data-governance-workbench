@@ -309,6 +309,7 @@ class DataSourceIn(BaseModel):
 
 class AgentPrompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
+    allow_external_model: bool = False
 
 class MetadataColumnClassificationIn(BaseModel):
     sensitivity_level: str = Field(pattern="^(未分级|公开|内部|敏感|高度敏感)$")
@@ -1733,7 +1734,9 @@ def agent_run(
             MetadataColumn.sensitivity_level.in_(["敏感", "高度敏感"])
         )) or 0,
     }
-    result = run_governance_agent(payload.prompt, context)
+    result = run_governance_agent(
+        payload.prompt, context, allow_external_model=payload.allow_external_model
+    )
     return {
         "status": "success",
         "agent": "governance-assistant",
