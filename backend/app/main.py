@@ -143,6 +143,28 @@ class MetadataSyncRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+class DataAsset(Base):
+    __tablename__ = "data_assets"
+    __table_args__ = (
+        UniqueConstraint("asset_code", name="uq_data_asset_code"),
+        UniqueConstraint("metadata_table_id", name="uq_data_asset_metadata_table"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_code: Mapped[str] = mapped_column(String(80), index=True)
+    name: Mapped[str] = mapped_column(String(180), index=True)
+    metadata_table_id: Mapped[int | None] = mapped_column(
+        ForeignKey("metadata_tables.id", ondelete="SET NULL"), nullable=True
+    )
+    business_domain: Mapped[str] = mapped_column(String(80), default="", index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    owner: Mapped[str] = mapped_column(String(100), default="")
+    sensitivity_level: Mapped[str] = mapped_column(String(30), default="未分级")
+    lifecycle_status: Mapped[str] = mapped_column(String(30), default="待确认")
+    tags: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 class LoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=80)
@@ -174,6 +196,18 @@ class DataSourceIn(BaseModel):
 
 class AgentPrompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
+
+class DataAssetIn(BaseModel):
+    asset_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=1, max_length=180)
+    metadata_table_id: int | None = None
+    business_domain: str = Field(default="", max_length=80)
+    description: str = Field(default="", max_length=4000)
+    owner_department: str = Field(default="", max_length=120)
+    owner: str = Field(default="", max_length=100)
+    sensitivity_level: str = Field(default="未分级", pattern="^(未分级|公开|内部|敏感|高度敏感)$")
+    lifecycle_status: str = Field(default="待确认", pattern="^(待确认|建设中|已发布|已下线)$")
+    tags: list[str] = Field(default_factory=list, max_length=30)
 
 
 def db_session():
@@ -742,6 +776,119 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
     finally:
         if source_engine is not None:
             source_engine.dispose()
+
+
+
+def asset_public(row: DataAsset, metadata: MetadataTable | None = None, source_name: str | None = None):
+    return {
+        "id": row.id, "asset_code": row.asset_code, "name": row.name,
+        "metadata_table_id": row.metadata_table_id,
+        "business_domain": row.business_domain, "description": row.description,
+        "owner_department": row.owner_department, "owner": row.owner,
+        "sensitivity_level": row.sensitivity_level, "lifecycle_status": row.lifecycle_status,
+        "tags": [tag for tag in row.tags.split(",") if tag],
+        "created_at": row.created_at, "updated_at": row.updated_at,
+        "source_name": source_name or "",
+        "schema_name": metadata.schema_name if metadata else "",
+        "table_name": metadata.table_name if metadata else "",
+    }
+
+
+@app.get("/api/v1/assets")
+def list_data_assets(
+    keyword: str | None = None,
+    business_domain: str | None = None,
+    owner_department: str | None = None,
+    lifecycle_status: str | None = None,
+    db: Session = Depends(db_session),
+):
+    stmt = select(DataAsset, MetadataTable, DataSource.name).outerjoin(
+        MetadataTable, DataAsset.metadata_table_id == MetadataTable.id
+    ).outerjoin(DataSource, MetadataTable.source_id == DataSource.id)
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        stmt = stmt.where(
+            DataAsset.name.ilike(like) | DataAsset.asset_code.ilike(like) |
+            DataAsset.description.ilike(like) | DataAsset.owner.ilike(like) |
+            DataAsset.owner_department.ilike(like) | DataAsset.tags.ilike(like) |
+            MetadataTable.table_name.ilike(like)
+        )
+    if business_domain:
+        stmt = stmt.where(DataAsset.business_domain == business_domain)
+    if owner_department:
+        stmt = stmt.where(DataAsset.owner_department == owner_department)
+    if lifecycle_status:
+        stmt = stmt.where(DataAsset.lifecycle_status == lifecycle_status)
+    stmt = stmt.order_by(DataAsset.updated_at.desc(), DataAsset.id.desc())
+    return [asset_public(asset, metadata, source_name) for asset, metadata, source_name in db.execute(stmt).all()]
+
+
+@app.post("/api/v1/assets", status_code=201)
+def create_data_asset(
+    payload: DataAssetIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    if db.scalar(select(DataAsset).where(DataAsset.asset_code == payload.asset_code)):
+        raise HTTPException(409, "资产编码已存在")
+    if payload.metadata_table_id is not None:
+        if not db.get(MetadataTable, payload.metadata_table_id):
+            raise HTTPException(404, "关联的元数据表不存在")
+        if db.scalar(select(DataAsset).where(DataAsset.metadata_table_id == payload.metadata_table_id)):
+            raise HTTPException(409, "该元数据表已登记为数据资产")
+    values = payload.model_dump()
+    values["tags"] = ",".join(dict.fromkeys(tag.strip() for tag in values["tags"] if tag.strip()))
+    row = DataAsset(**values)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    metadata = db.get(MetadataTable, row.metadata_table_id) if row.metadata_table_id else None
+    source = db.get(DataSource, metadata.source_id) if metadata else None
+    return asset_public(row, metadata, source.name if source else "")
+
+
+@app.patch("/api/v1/assets/{asset_id}")
+def update_data_asset(
+    asset_id: int,
+    payload: dict,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(DataAsset, asset_id)
+    if not row:
+        raise HTTPException(404, "数据资产不存在")
+    allowed = {"name", "business_domain", "description", "owner_department", "owner",
+               "sensitivity_level", "lifecycle_status", "tags"}
+    for key, value in payload.items():
+        if key not in allowed:
+            continue
+        if key == "tags":
+            if not isinstance(value, list) or len(value) > 30 or any(not isinstance(x, str) for x in value):
+                raise HTTPException(422, "tags 必须为最多 30 个字符串组成的数组")
+            value = ",".join(dict.fromkeys(tag.strip() for tag in value if tag.strip()))
+        if key == "sensitivity_level" and value not in {"未分级", "公开", "内部", "敏感", "高度敏感"}:
+            raise HTTPException(422, "无效的敏感级别")
+        if key == "lifecycle_status" and value not in {"待确认", "建设中", "已发布", "已下线"}:
+            raise HTTPException(422, "无效的资产状态")
+        setattr(row, key, value)
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    metadata = db.get(MetadataTable, row.metadata_table_id) if row.metadata_table_id else None
+    return asset_public(row, metadata)
+
+
+@app.delete("/api/v1/assets/{asset_id}", status_code=204)
+def delete_data_asset(
+    asset_id: int,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    row = db.get(DataAsset, asset_id)
+    if not row:
+        raise HTTPException(404, "数据资产不存在")
+    db.delete(row)
+    db.commit()
 
 
 @app.post("/api/v1/agents/run")
