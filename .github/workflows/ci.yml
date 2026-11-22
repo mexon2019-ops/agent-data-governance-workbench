@@ -2,6 +2,8 @@ name: Runtime smoke test and screenshots
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,7 +19,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install backend dependencies
-        run: pip install fastapi==0.115.12 uvicorn==0.34.2 SQLAlchemy==2.0.40
+        run: pip install fastapi==0.115.12 uvicorn==0.34.2 SQLAlchemy==2.0.40 pytest
+      - name: Run metadata ingestion unit tests
+        run: |
+          cd backend
+          DATABASE_URL=sqlite:////tmp/metadata-unit-ci.db PYTHONPATH=. pytest -q
       - name: Start backend
         run: |
           cd backend
@@ -59,10 +65,14 @@ jobs:
             await page.screenshot({path:'../artifacts/09-source-create-modal.png',fullPage:true});
             const health=await page.request.get('http://127.0.0.1:8000/health');
             const dashboard=await page.request.get('http://127.0.0.1:8000/api/v1/dashboard');
-            const results={health:health.status(),dashboard:dashboard.status(),pageErrors:errors};
+            const metadata=await page.request.get('http://127.0.0.1:8000/api/v1/metadata/tables');
+            const created=await page.request.post('http://127.0.0.1:8000/api/v1/datasources',{data:{name:'smoke-mysql',db_type:'mysql',host:'127.0.0.1',port:3306,database:'smoke',username:'readonly',password_env_key:'SMOKE_DB_PASSWORD',description:'CI smoke source'}});
+            const sync=created.status()===201?await page.request.post('http://127.0.0.1:8000/api/v1/datasources/1/sync'):null;
+            const runs=await page.request.get('http://127.0.0.1:8000/api/v1/datasources/1/sync-runs');
+            const results={health:health.status(),dashboard:dashboard.status(),metadata:metadata.status(),datasourceCreate:created.status(),sync:sync?.status(),syncExpectedFailure:sync?(await sync.json()).success===false:false,syncRuns:runs.status(),pageErrors:errors};
             require('fs').writeFileSync('../artifacts/smoke-results.json',JSON.stringify(results,null,2));
             await browser.close();
-            if(health.status()!==200||dashboard.status()!==200||errors.length) process.exit(1);
+            if(health.status()!==200||dashboard.status()!==200||metadata.status()!==200||created.status()!==201||sync?.status()!==200||runs.status()!==200||results.syncExpectedFailure!==true||errors.length) process.exit(1);
           })().catch(e=>{console.error(e);process.exit(1)});
           EOF
           node smoke.cjs
