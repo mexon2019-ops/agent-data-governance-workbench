@@ -13,6 +13,24 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+  mysql-test:
+    image: mysql:8.0
+    profiles: ["mysql-test"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_TEST_ROOT_PASSWORD:-local-only-change-this-root-password}
+      MYSQL_DATABASE: mes_test
+      MYSQL_TEST_READER_PASSWORD: ${MYSQL_TEST_READER_PASSWORD:-local-only-change-this-reader-password}
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysqltestdata:/var/lib/mysql
+      - ./docker/mysql-test/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
   backend:
     build: ./backend
     environment:
@@ -20,6 +38,7 @@ services:
       MES_DB_PASSWORD: ${MES_DB_PASSWORD:-}
       ORACLE_DB_PASSWORD: ${ORACLE_DB_PASSWORD:-}
       MYSQL_DB_PASSWORD: ${MYSQL_DB_PASSWORD:-}
+      MYSQL_TEST_READER_PASSWORD: ${MYSQL_TEST_READER_PASSWORD:-local-only-change-this-reader-password}
       PG_DB_PASSWORD: ${PG_DB_PASSWORD:-}
     ports: ["8000:8000"]
     depends_on:
@@ -33,3 +52,4 @@ services:
     restart: unless-stopped
 volumes:
   pgdata:
+  mysqltestdata:
