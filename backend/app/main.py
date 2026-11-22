@@ -387,13 +387,32 @@ def create_user(payload: UserCreateIn, _admin: User = Depends(require_permission
 @app.get("/api/v1/admin/roles")
 def list_roles(_admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
     return [{"name": role.name, "description": role.description, "permissions": sorted(p.code for p in role.permissions)} for role in db.scalars(select(Role).order_by(Role.id)).all()]
+
+@app.get("/api/v1/admin/audit-logs")
+def list_audit_logs(
+    _admin: User = Depends(require_permission("audit:read")),
+    offset: int = 0,
+    limit: int = 50,
+    db: Session = Depends(db_session),
+):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    rows = db.scalars(select(AuditLog).order_by(AuditLog.id.desc()).offset(offset).limit(limit)).all()
+    return [{
+        "id": row.id, "request_id": row.request_id, "actor": row.actor,
+        "action": row.action, "resource": row.resource,
+        "http_method": row.http_method, "path": row.path,
+        "status_code": row.status_code, "created_at": row.created_at,
+    } for row in rows]
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "data-governance-api", "version": "0.3.0"}
 
 
 @app.get("/api/v1/dashboard")
-def dashboard(db: Session = Depends(db_session)):
+def dashboard(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     counts = {c: db.scalar(select(func.count()).select_from(Record).where(Record.category == c)) or 0
               for c in ["asset", "standard", "quality", "task"]}
     counts["data_sources"] = db.scalar(select(func.count()).select_from(DataSource)) or 0
@@ -405,7 +424,7 @@ def dashboard(db: Session = Depends(db_session)):
 
 
 @app.get("/api/v1/records")
-def list_records(category: str | None = None, db: Session = Depends(db_session)):
+def list_records(category: str | None = None, _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     stmt = select(Record).order_by(Record.id.desc())
     if category:
         stmt = stmt.where(Record.category == category)
@@ -413,7 +432,7 @@ def list_records(category: str | None = None, db: Session = Depends(db_session))
 
 
 @app.post("/api/v1/records", status_code=201)
-def create_record(payload: RecordIn, db: Session = Depends(db_session)):
+def create_record(payload: RecordIn, _user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
     row = Record(**payload.model_dump())
     db.add(row)
     db.commit()
@@ -422,7 +441,7 @@ def create_record(payload: RecordIn, db: Session = Depends(db_session)):
 
 
 @app.patch("/api/v1/records/{record_id}")
-def update_record(record_id: int, payload: dict, db: Session = Depends(db_session)):
+def update_record(record_id: int, payload: dict, _user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
     row = db.get(Record, record_id)
     if not row:
         raise HTTPException(404, "记录不存在")
@@ -435,7 +454,7 @@ def update_record(record_id: int, payload: dict, db: Session = Depends(db_sessio
 
 
 @app.delete("/api/v1/records/{record_id}", status_code=204)
-def delete_record(record_id: int, db: Session = Depends(db_session)):
+def delete_record(record_id: int, _user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
     row = db.get(Record, record_id)
     if not row:
         raise HTTPException(404, "记录不存在")
@@ -465,12 +484,12 @@ def build_source_engine(row: DataSource):
 
 
 @app.get("/api/v1/datasources")
-def list_datasources(db: Session = Depends(db_session)):
+def list_datasources(_user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     return [datasource_public(x) for x in db.scalars(select(DataSource).order_by(DataSource.id.desc())).all()]
 
 
 @app.post("/api/v1/datasources", status_code=201)
-def create_datasource(payload: DataSourceIn, db: Session = Depends(db_session)):
+def create_datasource(payload: DataSourceIn, _user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     if db.scalar(select(DataSource).where(DataSource.name == payload.name)):
         raise HTTPException(409, "数据源名称已存在")
     row = DataSource(**payload.model_dump())
@@ -481,7 +500,7 @@ def create_datasource(payload: DataSourceIn, db: Session = Depends(db_session)):
 
 
 @app.patch("/api/v1/datasources/{source_id}")
-def update_datasource(source_id: int, payload: DataSourceIn, db: Session = Depends(db_session)):
+def update_datasource(source_id: int, payload: DataSourceIn, _user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     row = db.get(DataSource, source_id)
     if not row:
         raise HTTPException(404, "数据源不存在")
@@ -496,7 +515,7 @@ def update_datasource(source_id: int, payload: DataSourceIn, db: Session = Depen
 
 
 @app.delete("/api/v1/datasources/{source_id}", status_code=204)
-def delete_datasource(source_id: int, db: Session = Depends(db_session)):
+def delete_datasource(source_id: int, _user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     row = db.get(DataSource, source_id)
     if not row:
         raise HTTPException(404, "数据源不存在")
@@ -505,7 +524,7 @@ def delete_datasource(source_id: int, db: Session = Depends(db_session)):
 
 
 @app.post("/api/v1/datasources/{source_id}/test")
-def test_datasource(source_id: int, db: Session = Depends(db_session)):
+def test_datasource(source_id: int, _user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     row = db.get(DataSource, source_id)
     if not row:
         raise HTTPException(404, "数据源不存在")
@@ -540,7 +559,7 @@ def table_public(row: MetadataTable, source_name: str | None = None):
 
 @app.get("/api/v1/metadata/tables")
 def list_metadata_tables(source_id: int | None = None, keyword: str | None = None,
-                         db: Session = Depends(db_session)):
+                         _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     stmt = select(MetadataTable, DataSource.name).join(DataSource, MetadataTable.source_id == DataSource.id)
     if source_id:
         stmt = stmt.where(MetadataTable.source_id == source_id)
@@ -554,7 +573,7 @@ def list_metadata_tables(source_id: int | None = None, keyword: str | None = Non
 
 
 @app.get("/api/v1/metadata/tables/{table_id}")
-def get_metadata_table(table_id: int, db: Session = Depends(db_session)):
+def get_metadata_table(table_id: int, _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     row = db.get(MetadataTable, table_id)
     if not row:
         raise HTTPException(404, "元数据表不存在")
@@ -571,7 +590,7 @@ def get_metadata_table(table_id: int, db: Session = Depends(db_session)):
 
 
 @app.get("/api/v1/datasources/{source_id}/sync-runs")
-def list_sync_runs(source_id: int, db: Session = Depends(db_session)):
+def list_sync_runs(source_id: int, _user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     if not db.get(DataSource, source_id):
         raise HTTPException(404, "数据源不存在")
     rows = db.scalars(select(MetadataSyncRun).where(
@@ -580,7 +599,7 @@ def list_sync_runs(source_id: int, db: Session = Depends(db_session)):
 
 
 @app.post("/api/v1/datasources/{source_id}/sync")
-def sync_metadata(source_id: int, db: Session = Depends(db_session)):
+def sync_metadata(source_id: int, _user: User = Depends(require_permission("datasource:manage")), db: Session = Depends(db_session)):
     source = db.get(DataSource, source_id)
     if not source:
         raise HTTPException(404, "数据源不存在")
@@ -704,7 +723,7 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
 
 
 @app.post("/api/v1/agents/run")
-def agent_run(payload: AgentPrompt):
+def agent_run(payload: AgentPrompt, _user: User = Depends(require_permission("governance:write"))):
     return {"status": "draft", "agent": "governance-assistant",
             "reply": "已收到治理需求。当前版本先生成待审核建议；LangGraph 与模型网关将在后续版本接入。",
             "input_length": len(payload.prompt), "requires_human_approval": True}
