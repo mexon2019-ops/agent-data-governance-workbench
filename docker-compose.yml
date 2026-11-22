@@ -17,6 +17,10 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://dg_user:${POSTGRES_PASSWORD}@postgres:5432/data_governance
+      MES_DB_PASSWORD: ${MES_DB_PASSWORD:-}
+      ORACLE_DB_PASSWORD: ${ORACLE_DB_PASSWORD:-}
+      MYSQL_DB_PASSWORD: ${MYSQL_DB_PASSWORD:-}
+      PG_DB_PASSWORD: ${PG_DB_PASSWORD:-}
     ports: ["8000:8000"]
     depends_on:
       postgres:
