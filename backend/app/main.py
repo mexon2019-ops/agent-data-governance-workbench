@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Integer, Float, String, Table, Text, UniqueConstraint,
-    create_engine, select, func, delete, MetaData, Table, and_, or_, cast
+    create_engine, select, func, delete, MetaData, and_, or_, cast
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
