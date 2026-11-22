@@ -1024,6 +1024,10 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                 existing.synced_at = datetime.utcnow()
                 # Upsert columns by physical name so metadata IDs remain stable across
                 # repeatable syncs; standards/quality mappings reference these IDs.
+                db.execute(delete(MetadataLineage).where(
+                    MetadataLineage.source_table_id == existing.id,
+                    MetadataLineage.discovery_method == "DATABASE_CONSTRAINT",
+                ))
                 old_columns = {item.column_name: item for item in existing.columns}
                 seen_columns: set[str] = set()
                 for index, col in enumerate(columns, start=1):
@@ -1047,10 +1051,6 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
                     if old_name not in seen_columns:
                         db.delete(old_column)
                 db.flush()
-                db.execute(delete(MetadataLineage).where(
-                    MetadataLineage.source_table_id == existing.id,
-                    MetadataLineage.discovery_method == "DATABASE_CONSTRAINT",
-                ))
                 for source_column_name, target_schema, target_table, target_column in fk_relations:
                     source_column = db.scalar(select(MetadataColumn).where(
                         MetadataColumn.table_id == existing.id,
