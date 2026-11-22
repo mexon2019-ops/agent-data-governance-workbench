@@ -423,6 +423,9 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
         run.status = "失败"
         run.message = str(exc)
         run.finished_at = datetime.utcnow()
+        failed_source = db.get(DataSource, source_id)
+        if failed_source:
+            failed_source.status = "待配置凭据"
         db.commit()
         return {"success": False, "run_id": run.id, "message": run.message}
     except Exception as exc:
@@ -431,6 +434,9 @@ def sync_metadata(source_id: int, db: Session = Depends(db_session)):
         run.status = "失败"
         run.message = f"采集失败：{type(exc).__name__}。请检查网络、账号权限和数据库驱动。"
         run.finished_at = datetime.utcnow()
+        failed_source = db.get(DataSource, source_id)
+        if failed_source:
+            failed_source.status = "采集失败"
         db.commit()
         return {"success": False, "run_id": run.id, "message": run.message}
     finally:
