@@ -333,9 +333,9 @@ async def audit_mutating_requests(request: Request, call_next):
             required = "governance:read"
             path = request.url.path
             method = request.method
-            if path.startswith("/api/v1/datasources") and method in {"POST", "PATCH", "DELETE"}:
+            if path.startswith("/api/v1/datasources"):
                 required = "datasource:manage"
-            elif path.startswith("/api/v1/records") and method in {"POST", "PUT", "PATCH", "DELETE"}:
+            elif (path.startswith("/api/v1/records") and method in {"POST", "PUT", "PATCH", "DELETE"}) or path == "/api/v1/agents/run":
                 required = "governance:write"
             elif path.startswith("/api/v1/datasources/") and (path.endswith("/test") or path.endswith("/sync")):
                 required = "datasource:manage"
@@ -410,6 +410,24 @@ def create_user(payload: UserCreateIn, _admin: User = Depends(require_permission
 @app.get("/api/v1/admin/roles")
 def list_roles(_admin: User = Depends(require_permission("user:manage")), db: Session = Depends(db_session)):
     return [{"name": role.name, "description": role.description, "permissions": sorted(p.code for p in role.permissions)} for role in db.scalars(select(Role).order_by(Role.id)).all()]
+
+@app.get("/api/v1/admin/audit-logs")
+def list_audit_logs(
+    _admin: User = Depends(require_permission("audit:read")),
+    offset: int = 0,
+    limit: int = 50,
+    db: Session = Depends(db_session),
+):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    rows = db.scalars(select(AuditLog).order_by(AuditLog.id.desc()).offset(offset).limit(limit)).all()
+    return [{
+        "id": row.id, "request_id": row.request_id, "actor": row.actor,
+        "action": row.action, "resource": row.resource,
+        "http_method": row.http_method, "path": row.path,
+        "status_code": row.status_code, "created_at": row.created_at,
+    } for row in rows]
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "data-governance-api", "version": "0.3.0"}
