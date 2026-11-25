@@ -329,6 +329,12 @@ class DataSourceIn(BaseModel):
 class FineReportImportIn(BaseModel):
     reports: list[dict[str, Any]] = Field(min_length=1, max_length=5000)
 
+class LineageApprovalIn(BaseModel):
+    report_id: str = Field(min_length=1, max_length=180)
+    dataset: str = Field(min_length=1, max_length=180)
+    table_ids: list[int] = Field(min_length=1, max_length=500)
+    notes: str = Field(default="", max_length=2000)
+
 class AgentPrompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     allow_external_model: bool = False
@@ -726,6 +732,32 @@ def list_finereport_inventory(db: Session = Depends(db_session)):
         results.append({"id": row.id, "report_id": row.name, "status": row.status, "owner": row.owner, **data})
     return results
 
+
+
+@app.get("/api/v1/finereport/reports/{report_id}/lineage-approved")
+def get_approved_report_lineage(report_id: str, _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    rows = db.scalars(select(Record).where(Record.category == "finereport_lineage_approved", Record.name == report_id).order_by(Record.id.desc())).all()
+    return [{"id": row.id, "report_id": row.name, "status": row.status, **(json.loads(row.description or "{}"))} for row in rows]
+
+
+@app.post("/api/v1/finereport/lineage/approve")
+def approve_report_lineage(payload: LineageApprovalIn, _user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
+    report = db.scalar(select(Record).where(Record.category == "finereport_report", Record.name == payload.report_id))
+    if not report:
+        raise HTTPException(404, "FineReport报表不存在")
+    unique_ids = list(dict.fromkeys(payload.table_ids))
+    tables = db.scalars(select(MetadataTable).where(MetadataTable.id.in_(unique_ids))).all()
+    if len(tables) != len(unique_ids):
+        raise HTTPException(400, "包含不存在的元数据表ID")
+    approved = {"dataset": payload.dataset, "table_ids": unique_ids,
+                "tables": [{"table_id": t.id, "source_id": t.source_id, "schema_name": t.schema_name, "table_name": t.table_name} for t in tables],
+                "notes": payload.notes, "approved_by": _user.username, "approved_at": datetime.utcnow().isoformat()}
+    row = Record(category="finereport_lineage_approved", name=payload.report_id,
+                 description=json.dumps(approved, ensure_ascii=False), status="已确认", owner=_user.username)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "status": row.status, **approved}
 
 @app.get("/api/v1/records")
 def list_records(category: str | None = None, db: Session = Depends(db_session)):
