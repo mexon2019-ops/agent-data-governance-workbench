@@ -1971,6 +1971,38 @@ def finereport_lineage_preview(report_id: str, db: Session = Depends(db_session)
 
 
 
+@app.get("/api/v1/governance/maturity")
+def s20_governance_maturity(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    """Read-only, transparent governance maturity indicators; each metric is a ratio, not a certification."""
+    tables = db.scalars(select(MetadataTable)).all()
+    columns = db.scalars(select(MetadataColumn)).all()
+    assets = db.scalars(select(DataAsset)).all()
+    standards = db.scalars(select(DataStandard)).all()
+    versions = db.scalars(select(DataStandardVersion)).all()
+    published_version_ids = {v.id for v in versions if v.status == "已发布"}
+    mappings = db.scalars(select(DataStandardMapping)).all()
+    mapped_column_ids = {m.metadata_column_id for m in mappings if m.version_id in published_version_ids and m.mapping_status in ("已确认", "已通过", "已映射")}
+    rules = db.scalars(select(QualityRule).where(QualityRule.enabled == True)).all()
+    classified_columns = [col for col in columns if col.sensitivity_level and col.sensitivity_level != "未分级"]
+    rule_column_ids = {r.metadata_column_id for r in rules}
+    registered_table_ids = {a.metadata_table_id for a in assets if a.metadata_table_id is not None}
+    issue_rows = db.scalars(select(GovernanceIssue)).all()
+    closed_count = sum(1 for issue in issue_rows if issue.status == "已关闭")
+    def ratio(n, d):
+        return round(n / d * 100, 2) if d else 0.0
+    metrics = [
+        {"key":"asset_registration","label":"数据资产登记率","numerator":len(registered_table_ids),"denominator":len(tables),"value":ratio(len(registered_table_ids),len(tables)),"definition":"已登记为数据资产的元数据表 / 已采集元数据表"},
+        {"key":"metadata_coverage","label":"元数据采集覆盖","numerator":len(tables),"denominator":len(tables),"value":100.0 if tables else 0.0,"definition":"工作台已采集的表数量；不是企业全库覆盖率"},
+        {"key":"standard_mapping","label":"已确认标准映射率","numerator":len(mapped_column_ids),"denominator":len(columns),"value":ratio(len(mapped_column_ids),len(columns)),"definition":"映射到已发布标准且映射状态已确认的字段 / 已采集字段"},
+        {"key":"classification","label":"字段分类分级率","numerator":len(classified_columns),"denominator":len(columns),"value":ratio(len(classified_columns),len(columns)),"definition":"已设置敏感级别且不为未分级的字段 / 已采集字段"},
+        {"key":"quality_rule_coverage","label":"质量规则覆盖率","numerator":len(rule_column_ids),"denominator":len(columns),"value":ratio(len(rule_column_ids),len(columns)),"definition":"配置启用质量规则的字段数 / 已采集字段数"},
+        {"key":"issue_closure","label":"治理问题关闭率","numerator":closed_count,"denominator":len(issue_rows),"value":ratio(closed_count,len(issue_rows)),"definition":"已关闭治理问题 / 治理问题总数"},
+    ]
+    score = round(sum(item["value"] for item in metrics) / len(metrics), 2)
+    return {"score":score,"level":"初步建设" if score < 30 else "基础建设" if score < 60 else "规范建设" if score < 80 else "持续优化","metrics":metrics,
+            "summary":{"metadata_tables":len(tables),"metadata_columns":len(columns),"registered_assets":len(registered_table_ids),"standards":len(standards),"enabled_quality_rules":len(rules),"issues":len(issue_rows),"closed_issues":closed_count},
+            "disclaimer":"该评分为工作台内可见治理对象的参考指标，不代表企业整体治理成熟度或审计认证。请补充数据源范围、业务系统覆盖和人工核验后使用。"}
+
 @app.get("/api/v1/governance/overview")
 def s16_governance_overview(_user: User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     issues=db.scalars(select(GovernanceIssue)).all()
