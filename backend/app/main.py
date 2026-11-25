@@ -1969,3 +1969,28 @@ def finereport_lineage_preview(report_id: str, db: Session = Depends(db_session)
             "preview_only": True, "sql_executed": False, "datasets": previews,
             "review_required": not previews or any(item["review_required"] for item in previews)}
 
+
+
+@app.get("/api/v1/governance/overview")
+def s16_governance_overview(_user: User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    issues=db.scalars(select(GovernanceIssue)).all()
+    now=datetime.utcnow()
+    active=[i for i in issues if i.status!="已关闭"]
+    closed=[i for i in issues if i.status=="已关闭"]
+    overdue=[i for i in active if i.due_date and i.due_date<now]
+    runs=db.scalars(select(QualityRun).order_by(QualityRun.id.desc())).all()
+    latest_issues=sorted(issues,key=lambda i:i.updated_at or i.created_at or now,reverse=True)[:10]
+    def grouped(items,key):
+        result={}
+        for item in items: result[str(key(item) or "未指定")]=result.get(str(key(item) or "未指定"),0)+1
+        return result
+    return {"issue_total":len(issues),"active_count":len(active),"closed_count":len(closed),
+        "overdue_count":len(overdue),"closure_rate":round(len(closed)/len(issues)*100,2) if issues else 0,
+        "status_distribution":grouped(issues,lambda i:i.status),
+        "severity_distribution":grouped(issues,lambda i:i.severity),
+        "department_distribution":grouped(active,lambda i:i.owner_department),
+        "quality_runs":{"total":len(runs),"success":sum(1 for r in runs if r.status in ("成功","完成") and r.passed),
+            "failed":sum(1 for r in runs if r.status in ("失败","异常") or not r.passed)},
+        "latest_issues":[{"id":i.id,"issue_code":i.issue_code,"title":i.title,"severity":i.severity,
+            "owner_department":i.owner_department,"owner":i.owner,"status":i.status,"due_date":i.due_date,
+            "updated_at":i.updated_at} for i in latest_issues]}
