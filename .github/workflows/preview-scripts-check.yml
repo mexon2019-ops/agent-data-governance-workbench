@@ -23,6 +23,7 @@ jobs:
           bash -n scripts/start-mysql-test.sh
           bash -n scripts/preflight-preview.sh
           bash -n scripts/init-preview-env.sh
+          bash -n scripts/setup-preview.sh
       - name: Compose configuration validation
         run: |
           cp .env.example .env
