@@ -758,6 +758,7 @@ def assess_finereport_sensitivity(report_id: str, _user: User = Depends(require_
     for row in approved_rows:
         try:
             approved.append(json.loads(row.description or "{}"))
+            break  # only the newest valid approved lineage is authoritative
         except (TypeError, json.JSONDecodeError):
             continue
     table_ids = list(dict.fromkeys(tid for item in approved for tid in item.get("table_ids", []) if isinstance(tid, int)))
@@ -793,7 +794,9 @@ def review_finereport_sensitivity(report_id: str, payload: ReportSensitivityRevi
         except (TypeError, json.JSONDecodeError):
             pass
     table_ids = list(dict.fromkeys(table_ids))
-    columns = db.scalars(select(MetadataColumn).where(MetadataColumn.table_id.in_(table_ids))).all() if table_ids else []
+    if not table_ids:
+        raise HTTPException(409, "报表尚无已确认血缘，不能完成基于血缘的敏感度审核")
+    columns = db.scalars(select(MetadataColumn).where(MetadataColumn.table_id.in_(table_ids))).all()
     levels = ["未分级", "公开", "内部", "敏感", "高度敏感"]
     suggested = "未分级"
     for column in columns:
@@ -809,7 +812,14 @@ def review_finereport_sensitivity(report_id: str, payload: ReportSensitivityRevi
 @app.get("/api/v1/finereport/sensitivity-reviews")
 def list_finereport_sensitivity_reviews(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     rows = db.scalars(select(Record).where(Record.category == "finereport_sensitivity_review").order_by(Record.id.desc())).all()
-    return [{"id": row.id, "report_id": row.name, "status": row.status, "owner": row.owner, **(json.loads(row.description or "{}"))} for row in rows]
+    results = []
+    for row in rows:
+        try:
+            details = json.loads(row.description or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {"history_parse_error": True}
+        results.append({"id": row.id, "report_id": row.name, "status": row.status, "owner": row.owner, **details})
+    return results
 
 
 @app.post("/api/v1/finereport/lineage/approve")
