@@ -1508,7 +1508,7 @@ def quality_rule_public(row: QualityRule):
 
 
 @app.get("/api/v1/governance/classification-suggestions")
-def governance_classification_suggestions(limit: int = 500, db: Session = Depends(db_session)):
+def governance_classification_suggestions(limit: int = 500, _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     """Metadata-only batch classification suggestions; never reads business rows."""
     from .classification_service import suggest_field_classification
     limit = max(1, min(limit, 2000))
@@ -1525,7 +1525,7 @@ def governance_classification_suggestions(limit: int = 500, db: Session = Depend
         "notice": "仅元数据字段名与类型推断建议，需人工审核；不读取业务数据行。"}
 
 @app.get("/api/v1/governance/standard-rule-preview")
-def governance_standard_rule_preview(db: Session = Depends(db_session)):
+def governance_standard_rule_preview(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     """Preview rule candidates from approved mappings to published standards; no writes."""
     versions = db.scalars(select(DataStandardVersion).where(DataStandardVersion.status == "已发布")).all()
     candidates = []
