@@ -2051,3 +2051,124 @@ def finereport_lineage_preview(report_id: str, db: Session = Depends(db_session)
             "preview_only": True, "sql_executed": False, "datasets": previews,
             "review_required": not previews or any(item["review_required"] for item in previews)}
 
+
+
+# Sprint 15: FineReport field-to-standard governance
+class FineReportStandardReviewIn(BaseModel):
+    metadata_column_id: int
+    standard_version_id: int
+    decision: str = Field(pattern="^(已落标|不符合)$")
+    note: str = Field(default="", max_length=2000)
+
+def _s15_latest_lineage_table_ids(db: Session, report_id: str):
+    rows = db.scalars(select(Record).where(
+        Record.category == "finereport_lineage_approved", Record.name == report_id
+    ).order_by(Record.id.desc())).all()
+    for row in rows:
+        try:
+            data = json.loads(row.description or "{}")
+            ids = [int(x) for x in data.get("table_ids", []) if isinstance(x, int)]
+            if ids:
+                return list(dict.fromkeys(ids))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return []
+
+def _s15_candidates(db: Session, report_id: str):
+    table_ids = _s15_latest_lineage_table_ids(db, report_id)
+    if not table_ids:
+        return None
+    columns = db.scalars(select(MetadataColumn).where(MetadataColumn.table_id.in_(table_ids))).all()
+    versions = db.scalars(select(DataStandardVersion).where(DataStandardVersion.status == "已发布")).all()
+    standards = {s.id:s for s in db.scalars(select(DataStandard)).all()}
+    candidates=[]
+    for col in columns:
+        choices=[]
+        c_name=(col.column_name or "").strip().lower()
+        c_desc=(col.description or "").strip().lower()
+        c_type=(col.data_type or "").strip().lower()
+        for v in versions:
+            s=standards.get(v.standard_id)
+            if not s or s.status != "已发布": continue
+            name=(s.name or "").strip().lower()
+            code=(s.standard_code or "").strip().lower()
+            definition=(v.definition or s.description or "").strip().lower()
+            score=0
+            reasons=[]
+            if c_name and c_name in {name,code}: score+=60; reasons.append("字段名与标准名称/编码精确匹配")
+            elif c_name and (c_name in name or name in c_name or c_name in code): score+=35; reasons.append("字段名与标准名称/编码部分匹配")
+            tokens=[x for x in [name,code] if x]
+            if c_desc and any(x in c_desc for x in tokens): score+=30; reasons.append("字段描述命中标准词汇")
+            elif c_desc and definition and (c_desc in definition or definition in c_desc): score+=15; reasons.append("描述/定义文本关联")
+            if c_type and v.data_type and c_type==v.data_type.strip().lower(): score+=10; reasons.append("数据类型一致")
+            if score:
+                choices.append({"standard_id":s.id,"standard_code":s.standard_code,"standard_name":s.name,
+                    "version_id":v.id,"version_number":v.version_number,"score":score,
+                    "reasons":reasons,"definition":v.definition,"data_type":v.data_type})
+        choices.sort(key=lambda x:(-x["score"],x["standard_code"]))
+        candidates.append({"metadata_column_id":col.id,"table_id":col.table_id,"column_name":col.column_name,
+            "column_description":col.description,"data_type":col.data_type,"candidates":choices[:5]})
+    return table_ids,candidates
+
+@app.get("/api/v1/finereport/reports/{report_id}/standard-candidates")
+def finereport_standard_candidates(report_id: str,_user: User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    report=db.scalar(select(Record).where(Record.category=="finereport_report",Record.name==report_id))
+    if not report: raise HTTPException(404,"FineReport报表不存在")
+    result=_s15_candidates(db,report_id)
+    if result is None: raise HTTPException(409,"报表尚无有效已确认血缘")
+    table_ids,columns=result
+    return {"report_id":report_id,"table_ids":table_ids,"columns":columns,
+        "score_note":"启发式匹配分数，仅用于候选排序，不代表准确率；必须人工审核。"}
+
+@app.post("/api/v1/finereport/reports/{report_id}/standard-review")
+def finereport_standard_review(report_id:str,payload:FineReportStandardReviewIn,
+    _user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    report=db.scalar(select(Record).where(Record.category=="finereport_report",Record.name==report_id))
+    if not report: raise HTTPException(404,"FineReport报表不存在")
+    table_ids=_s15_latest_lineage_table_ids(db,report_id)
+    if not table_ids: raise HTTPException(409,"报表尚无已确认血缘")
+    column=db.get(MetadataColumn,payload.metadata_column_id)
+    if not column or column.table_id not in table_ids: raise HTTPException(404,"字段不属于该报表已确认血缘")
+    version=db.get(DataStandardVersion,payload.standard_version_id)
+    standard=db.get(DataStandard,version.standard_id) if version else None
+    if not version or not standard or version.status!="已发布" or standard.status!="已发布":
+        raise HTTPException(409,"只能关联已发布的数据标准及版本")
+    if payload.decision=="已落标":
+        mapping=db.scalar(select(DataStandardMapping).where(DataStandardMapping.version_id==version.id,
+            DataStandardMapping.metadata_column_id==column.id))
+        if mapping:
+            mapping.mapping_status="已落标"; mapping.note=payload.note; mapping.mapped_at=datetime.utcnow()
+        else:
+            db.add(DataStandardMapping(version_id=version.id,metadata_column_id=column.id,mapping_status="已落标",note=payload.note))
+    ledger={"report_id":report_id,"metadata_column_id":column.id,"column_name":column.column_name,
+        "table_id":column.table_id,"standard_id":standard.id,"standard_code":standard.standard_code,
+        "standard_name":standard.name,"standard_version_id":version.id,"version_number":version.version_number,
+        "decision":payload.decision,"note":payload.note,"reviewer":_user.username,"reviewed_at":datetime.utcnow().isoformat()}
+    db.add(Record(category="finereport_standard_review",name=report_id,description=json.dumps(ledger,ensure_ascii=False),
+        status=payload.decision,owner=_user.username))
+    db.commit()
+    return {"success":True,"review":ledger}
+
+@app.get("/api/v1/finereport/standard-coverage")
+def finereport_standard_coverage(report_id:str|None=None,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    reports=db.scalars(select(Record).where(Record.category=="finereport_report")).all()
+    reviews=db.scalars(select(Record).where(Record.category=="finereport_standard_review").order_by(Record.id.desc())).all()
+    review_latest={}
+    for r in reviews:
+        try:
+            d=json.loads(r.description or "{}"); key=(d.get("report_id"),d.get("metadata_column_id"))
+            review_latest.setdefault(key,d)
+        except (TypeError,json.JSONDecodeError): continue
+    out=[]
+    for r in reports:
+        if report_id and r.name!=report_id: continue
+        table_ids=_s15_latest_lineage_table_ids(db,r.name)
+        cols=db.scalars(select(MetadataColumn).where(MetadataColumn.table_id.in_(table_ids))).all() if table_ids else []
+        mapped=set()
+        for (rid,cid),d in review_latest.items():
+            if rid==r.name and d.get("decision")=="已落标" and cid in {c.id for c in cols}: mapped.add(cid)
+        total=len(cols); count=len(mapped)
+        out.append({"report_id":r.name,"report_name":r.description,"column_count":total,"mapped_count":count,
+            "unmapped_count":total-count,"coverage_rate":round(count/total*100,2) if total else 0,
+            "unmapped_columns":[{"column_id":c.id,"table_id":c.table_id,"column_name":c.column_name} for c in cols if c.id not in mapped]})
+    return out
