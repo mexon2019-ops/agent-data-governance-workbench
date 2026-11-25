@@ -329,6 +329,12 @@ class DataSourceIn(BaseModel):
 class FineReportImportIn(BaseModel):
     reports: list[dict[str, Any]] = Field(min_length=1, max_length=5000)
 
+
+class ReportSensitivityReviewIn(BaseModel):
+    report_id: str = Field(min_length=1, max_length=180)
+    sensitivity_level: str = Field(pattern="^(未分级|公开|内部|敏感|高度敏感)$")
+    notes: str = Field(default="", max_length=2000)
+
 class LineageApprovalIn(BaseModel):
     report_id: str = Field(min_length=1, max_length=180)
     dataset: str = Field(min_length=1, max_length=180)
@@ -738,6 +744,72 @@ def list_finereport_inventory(db: Session = Depends(db_session)):
 def get_approved_report_lineage(report_id: str, _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     rows = db.scalars(select(Record).where(Record.category == "finereport_lineage_approved", Record.name == report_id).order_by(Record.id.desc())).all()
     return [{"id": row.id, "report_id": row.name, "status": row.status, **(json.loads(row.description or "{}"))} for row in rows]
+
+
+
+
+@app.get("/api/v1/finereport/reports/{report_id}/sensitivity-assessment")
+def assess_finereport_sensitivity(report_id: str, _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    report = db.scalar(select(Record).where(Record.category == "finereport_report", Record.name == report_id))
+    if not report:
+        raise HTTPException(404, "FineReport报表不存在")
+    approved_rows = db.scalars(select(Record).where(Record.category == "finereport_lineage_approved", Record.name == report_id).order_by(Record.id.desc())).all()
+    approved = []
+    for row in approved_rows:
+        try:
+            approved.append(json.loads(row.description or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+    table_ids = list(dict.fromkeys(tid for item in approved for tid in item.get("table_ids", []) if isinstance(tid, int)))
+    tables = db.scalars(select(MetadataTable).where(MetadataTable.id.in_(table_ids))).all() if table_ids else []
+    columns = db.scalars(select(MetadataColumn).where(MetadataColumn.table_id.in_(table_ids))).all() if table_ids else []
+    levels = ["未分级", "公开", "内部", "敏感", "高度敏感"]
+    risk = "未分级"
+    for column in columns:
+        if column.sensitivity_level in levels and levels.index(column.sensitivity_level) > levels.index(risk):
+            risk = column.sensitivity_level
+    if not approved or not tables:
+        risk = "未分级"
+    return {"report_id": report_id, "assessment_level": risk, "review_required": True,
+            "confirmed_lineage": bool(approved and tables), "tables": [{"table_id": t.id, "schema_name": t.schema_name, "table_name": t.table_name} for t in tables],
+            "classified_columns": [{"table_id": c.table_id, "column_id": c.id, "column_name": c.column_name, "sensitivity_level": c.sensitivity_level, "classification_basis": c.classification_basis} for c in columns if c.sensitivity_level != "未分级"],
+            "unclassified_columns": [{"table_id": c.table_id, "column_id": c.id, "column_name": c.column_name} for c in columns if c.sensitivity_level == "未分级"],
+            "reason": "基于已确认报表血缘关联字段分级取最高级；此结果为建议，必须人工审核。",
+            "approved_lineage_count": len(approved), "table_count": len(tables), "column_count": len(columns)}
+
+@app.post("/api/v1/finereport/reports/{report_id}/sensitivity-review")
+def review_finereport_sensitivity(report_id: str, payload: ReportSensitivityReviewIn, _user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
+    if payload.report_id != report_id:
+        raise HTTPException(400, "报表标识不一致")
+    report = db.scalar(select(Record).where(Record.category == "finereport_report", Record.name == report_id))
+    if not report:
+        raise HTTPException(404, "FineReport报表不存在")
+    # Recompute the advisory level from confirmed lineage only; unconfirmed previews are excluded.
+    approved_rows = db.scalars(select(Record).where(Record.category == "finereport_lineage_approved", Record.name == report_id)).all()
+    table_ids = []
+    for row in approved_rows:
+        try:
+            table_ids.extend(tid for tid in json.loads(row.description or "{}").get("table_ids", []) if isinstance(tid, int))
+        except (TypeError, json.JSONDecodeError):
+            pass
+    table_ids = list(dict.fromkeys(table_ids))
+    columns = db.scalars(select(MetadataColumn).where(MetadataColumn.table_id.in_(table_ids))).all() if table_ids else []
+    levels = ["未分级", "公开", "内部", "敏感", "高度敏感"]
+    suggested = "未分级"
+    for column in columns:
+        if column.sensitivity_level in levels and levels.index(column.sensitivity_level) > levels.index(suggested):
+            suggested = column.sensitivity_level
+    row = Record(category="finereport_sensitivity_review", name=report_id,
+        description=json.dumps({"suggested_level": suggested, "reviewed_level": payload.sensitivity_level,
+        "notes": payload.notes, "reviewer": _user.username, "reviewed_at": datetime.utcnow().isoformat(),
+        "lineage_table_ids": table_ids}, ensure_ascii=False), status="已审核", owner=_user.username)
+    db.add(row); db.commit(); db.refresh(row)
+    return {"id": row.id, "report_id": report_id, "suggested_level": suggested, "reviewed_level": payload.sensitivity_level, "status": row.status, "reviewer": _user.username}
+
+@app.get("/api/v1/finereport/sensitivity-reviews")
+def list_finereport_sensitivity_reviews(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    rows = db.scalars(select(Record).where(Record.category == "finereport_sensitivity_review").order_by(Record.id.desc())).all()
+    return [{"id": row.id, "report_id": row.name, "status": row.status, "owner": row.owner, **(json.loads(row.description or "{}"))} for row in rows]
 
 
 @app.post("/api/v1/finereport/lineage/approve")
