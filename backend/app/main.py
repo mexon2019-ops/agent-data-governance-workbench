@@ -6,7 +6,7 @@ import json
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Any
 
@@ -1994,3 +1994,21 @@ def s16_governance_overview(_user: User=Depends(require_permission("governance:r
         "latest_issues":[{"id":i.id,"issue_code":i.issue_code,"title":i.title,"severity":i.severity,
             "owner_department":i.owner_department,"owner":i.owner,"status":i.status,"due_date":i.due_date,
             "updated_at":i.updated_at} for i in latest_issues]}
+
+
+# Sprint 19: governance trends aggregated from governance issue lifecycle timestamps.
+@app.get("/api/v1/governance/trends")
+def s19_governance_trends(_user: User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    now=datetime.utcnow()
+    months=[]
+    for offset in range(11,-1,-1):
+        year=now.year; month=now.month-offset
+        while month<=0: year-=1; month+=12
+        months.append(datetime(year,month,1))
+    buckets=[]
+    for start in months:
+        end=datetime(start.year+1,1,1) if start.month==12 else datetime(start.year,start.month+1,1)
+        created=db.scalar(select(func.count(GovernanceIssue.id)).where(GovernanceIssue.created_at>=start,GovernanceIssue.created_at<end)) or 0
+        closed=db.scalar(select(func.count(GovernanceIssue.id)).where(GovernanceIssue.closed_at>=start,GovernanceIssue.closed_at<end)) or 0
+        buckets.append({"month":start.strftime("%Y-%m"),"created":created,"closed":closed})
+    return {"months":buckets,"basis":"按治理问题创建时间及关闭时间统计；历史逾期状态不回溯，数据来自治理问题记录。"}
