@@ -23,6 +23,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from sqlalchemy import inspect as sa_inspect
 from .agent_service import run_governance_agent
 from .classification_service import suggest_field_classification
+from .finereport_service import extract_sql_table_references
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -1877,3 +1878,62 @@ def agent_run(
         "context_scope": "aggregate_only",
         **result,
     }
+
+@app.get("/api/v1/finereport/reports/{report_id}/lineage-preview")
+def finereport_lineage_preview(report_id: str, db: Session = Depends(db_session)):
+    """Read-only, unconfirmed report SQL lineage preview; SQL is never executed."""
+    report_row = db.scalar(select(Record).where(
+        Record.category == "finereport_report", Record.name == report_id
+    ))
+    if not report_row:
+        raise HTTPException(404, "FineReport报表不存在")
+    try:
+        inventory = json.loads(report_row.description or "{}")
+    except (TypeError, json.JSONDecodeError):
+        inventory = {}
+
+    datasets = []
+    raw_datasets = inventory.get("datasets")
+    if isinstance(raw_datasets, list):
+        for i, item in enumerate(raw_datasets):
+            if isinstance(item, dict) and isinstance(item.get("sql"), str):
+                datasets.append({"dataset": str(item.get("name") or item.get("id") or f"dataset_{i+1}"), "sql": item["sql"]})
+            elif isinstance(item, str):
+                datasets.append({"dataset": f"dataset_{i+1}", "sql": item})
+    elif isinstance(raw_datasets, dict):
+        for name, item in raw_datasets.items():
+            if isinstance(item, dict) and isinstance(item.get("sql"), str):
+                datasets.append({"dataset": str(name), "sql": item["sql"]})
+            elif isinstance(item, str):
+                datasets.append({"dataset": str(name), "sql": item})
+    if isinstance(inventory.get("dataset_sql"), str) and inventory["dataset_sql"].strip():
+        datasets.append({"dataset": "dataset_sql", "sql": inventory["dataset_sql"]})
+
+    catalog = db.scalars(select(MetadataTable)).all()
+    previews = []
+    for dataset in datasets:
+        extracted = extract_sql_table_references(dataset["sql"])
+        matched, unresolved, ambiguous = [], [], []
+        for reference in extracted["tables"]:
+            parts = reference.split(".")
+            table_name = parts[-1].strip().casefold()
+            schema_name = parts[-2].strip().casefold() if len(parts) >= 2 else None
+            candidates = [t for t in catalog if t.table_name.casefold() == table_name
+                          and (schema_name is None or (t.schema_name or "").casefold() == schema_name)]
+            if len(candidates) == 1:
+                matched.append({"reference": reference, "table_id": candidates[0].id,
+                               "source_id": candidates[0].source_id,
+                               "schema_name": candidates[0].schema_name,
+                               "table_name": candidates[0].table_name})
+            elif len(candidates) > 1:
+                ambiguous.append({"reference": reference, "candidate_table_ids": [t.id for t in candidates]})
+            else:
+                unresolved.append(reference)
+        previews.append({"dataset": dataset["dataset"], "references": extracted["tables"],
+                         "matched": matched, "unresolved": unresolved, "ambiguous": ambiguous,
+                         "review_required": extracted["review_required"] or bool(unresolved) or bool(ambiguous),
+                         "parser_reason": extracted["reason"]})
+    return {"report_id": report_id, "report_name": inventory.get("name") or inventory.get("report_name") or report_row.name,
+            "preview_only": True, "sql_executed": False, "datasets": previews,
+            "review_required": not previews or any(item["review_required"] for item in previews)}
+
