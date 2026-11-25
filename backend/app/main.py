@@ -1971,6 +1971,118 @@ def finereport_lineage_preview(report_id: str, db: Session = Depends(db_session)
 
 
 
+@app.get("/api/v1/governance/standard-coverage")
+def s21_standard_coverage(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    """Read-only standard coverage and mapping review analytics."""
+    tables = db.scalars(select(MetadataTable)).all()
+    columns = db.scalars(select(MetadataColumn)).all()
+    versions = db.scalars(select(DataStandardVersion)).all()
+    standards = db.scalars(select(DataStandard)).all()
+    published = {v.id for v in versions if v.status == "已发布"}
+    mappings = db.scalars(select(DataStandardMapping)).all()
+    confirmed = {m.metadata_column_id for m in mappings if m.version_id in published and m.mapping_status in ("已确认", "已通过", "已映射")}
+    pending = sum(1 for m in mappings if m.mapping_status == "待核验")
+    rejected = sum(1 for m in mappings if m.mapping_status in ("已拒绝", "拒绝"))
+    domains = {}
+    for standard in standards:
+        domain = standard.business_domain or "未指定业务域"
+        row = domains.setdefault(domain, {"standards": 0, "published_standards": 0, "mapped_columns": 0})
+        row["standards"] += 1
+        row["published_standards"] += sum(1 for v in standard.versions if v.status == "已发布")
+    for mapping in mappings:
+        if mapping.version_id in published and mapping.mapping_status in ("已确认", "已通过", "已映射"):
+            ver = next((v for v in versions if v.id == mapping.version_id), None)
+            std = next((s for s in standards if ver and s.id == ver.standard_id), None)
+            if std:
+                domains.setdefault(std.business_domain or "未指定业务域", {"standards": 0, "published_standards": 0, "mapped_columns": 0})["mapped_columns"] += 1
+    unmapped = [{"column_id": c.id, "column": c.column_name, "table_id": c.table_id, "data_type": c.data_type, "sensitivity": c.sensitivity_level}
+                for c in columns if c.id not in confirmed]
+    return {"scope":{"tables":len(tables),"columns":len(columns),"standards":len(standards)},
+        "published_standards":sum(1 for v in versions if v.status=="已发布"),
+        "published_version_count":len(published),"confirmed_mapped_columns":len(confirmed),
+        "mapping_coverage_pct":round(len(confirmed)/len(columns)*100,2) if columns else 0,
+        "pending_reviews":pending,"rejected_reviews":rejected,"unmapped_columns":unmapped[:500],
+        "unmapped_truncated":len(unmapped)>500,"business_domains":domains,
+        "note":"Coverage is limited to collected metadata and published versions; mapping status is review-ledger data."}
+
+@app.get("/api/v1/governance/quality-analytics")
+def s22_quality_analytics(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    """Aggregate existing quality-run results; does not execute source queries."""
+    rules = db.scalars(select(QualityRule)).all()
+    runs = db.scalars(select(QualityRun).order_by(QualityRun.started_at.desc())).all()
+    by_rule = {}
+    for rule in rules:
+        by_rule[rule.id] = {"rule_id":rule.id,"code":rule.rule_code,"name":rule.name,"enabled":rule.enabled,
+            "runs":0,"latest_pass_rate":None,"latest_failed_count":None,"latest_status":None,"latest_at":None}
+    for run in runs:
+        item=by_rule.get(run.rule_id)
+        if item:
+            item["runs"]+=1
+            if item["latest_at"] is None:
+                item["latest_pass_rate"]=run.pass_rate;item["latest_failed_count"]=run.failed_count
+                item["latest_status"]=run.status;item["latest_at"]=run.started_at
+    completed=[r for r in runs if r.status in ("成功","完成","失败","异常")]
+    return {"rules_total":len(rules),"enabled_rules":sum(1 for r in rules if r.enabled),
+        "runs_total":len(runs),"completed_runs":len(completed),
+        "successful_runs":sum(1 for r in completed if r.passed),
+        "failed_runs":sum(1 for r in completed if not r.passed),
+        "average_pass_rate":round(sum(r.pass_rate for r in completed)/len(completed),2) if completed else 0,
+        "rules":sorted(by_rule.values(),key=lambda x:(x["latest_pass_rate"] is None,x["latest_pass_rate"] or 0)),
+        "note":"Aggregates stored runs only; no new quality tests are executed."}
+
+@app.get("/api/v1/governance/classification-analytics")
+def s23_classification_analytics(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    """Read-only field classification coverage and risk-level inventory."""
+    columns=db.scalars(select(MetadataColumn)).all()
+    tables=db.scalars(select(MetadataTable)).all()
+    levels=("公开","内部","敏感","高度敏感","未分级")
+    distribution={level:sum(1 for c in columns if (c.sensitivity_level or "未分级")==level) for level in levels}
+    unclassified=[{"column_id":c.id,"column":c.column_name,"table_id":c.table_id,"type":c.data_type}
+        for c in columns if not c.sensitivity_level or c.sensitivity_level=="未分级"]
+    table_summary=[]
+    for t in tables:
+        cols=[c for c in columns if c.table_id==t.id]
+        table_summary.append({"table_id":t.id,"schema":t.schema_name,"table":t.table_name,
+            "column_count":len(cols),"classified_count":sum(1 for c in cols if c.sensitivity_level and c.sensitivity_level!="未分级"),
+            "coverage_pct":round(sum(1 for c in cols if c.sensitivity_level and c.sensitivity_level!="未分级")/len(cols)*100,2) if cols else 0})
+    return {"column_total":len(columns),"classified_count":len(columns)-len(unclassified),
+        "coverage_pct":round((len(columns)-len(unclassified))/len(columns)*100,2) if columns else 0,
+        "distribution":distribution,"unclassified_columns":unclassified[:500],"unclassified_truncated":len(unclassified)>500,
+        "tables":table_summary,"note":"Classification coverage is within collected metadata only; levels require human confirmation."}
+
+@app.get("/api/v1/governance/priorities")
+def s24_governance_priorities(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    """Transparent, advisory issue/rule priority queue; no automatic assignment or remediation."""
+    now=datetime.utcnow()
+    issues=db.scalars(select(GovernanceIssue)).all()
+    severity_weight={"高":40,"严重":50,"中":25,"低":10}
+    status_weight={"待分派":10,"整改中":5,"待复测":8,"待关闭":2}
+    priority_rows=[]
+    for issue in issues:
+        if issue.status=="已关闭": continue
+        overdue=bool(issue.due_date and issue.due_date<now)
+        score=severity_weight.get(issue.severity,15)+status_weight.get(issue.status,0)+(25 if overdue else 0)
+        priority_rows.append({"type":"issue","id":issue.id,"code":issue.issue_code,"title":issue.title,
+            "severity":issue.severity,"status":issue.status,"owner_department":issue.owner_department,
+            "due_date":issue.due_date,"overdue":overdue,"score":score,
+            "reason":"逾期" if overdue else "按严重级别和当前流程状态计算"})
+    rules=db.scalars(select(QualityRule).where(QualityRule.enabled==True)).all()
+    latest_runs=db.scalars(select(QualityRun).order_by(QualityRun.started_at.desc())).all()
+    seen=set()
+    for run in latest_runs:
+        if run.rule_id in seen: continue
+        seen.add(run.rule_id)
+        rule=next((r for r in rules if r.id==run.rule_id),None)
+        if rule and run.failed_count>0:
+            score=severity_weight.get(rule.severity,15)+min(25,run.failed_count)
+            priority_rows.append({"type":"quality_rule","id":rule.id,"code":rule.rule_code,"title":rule.name,
+                "severity":rule.severity,"failed_count":run.failed_count,"pass_rate":run.pass_rate,
+                "score":score,"reason":"最近一次已保存检测结果存在异常"})
+    priority_rows.sort(key=lambda x:(x["score"],x.get("overdue",False)),reverse=True)
+    return {"items":priority_rows[:100],"total":len(priority_rows),
+        "scoring":"建议排序分：严重级别基础分 + 流程状态加分 + 逾期加分；质量规则按严重级别和最近失败数加分。",
+        "disclaimer":"该排序为辅助建议，不替代责任部门判断；不会自动分派、执行检测或修改数据。"}
+
 @app.get("/api/v1/governance/maturity")
 def s20_governance_maturity(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     """Read-only, transparent governance maturity indicators; each metric is a ratio, not a certification."""
