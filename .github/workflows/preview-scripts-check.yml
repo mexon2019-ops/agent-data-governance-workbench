@@ -1,0 +1,25 @@
+name: Preview deployment script checks
+
+on:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - ".github/workflows/preview-scripts-check.yml"
+
+jobs:
+  shell-and-compose-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax check
+        run: |
+          bash -n scripts/deploy-preview.sh
+          bash -n scripts/health-check.sh
+          bash -n scripts/backup-postgres.sh
+          bash -n scripts/diagnose.sh
+      - name: Compose configuration validation
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
