@@ -725,7 +725,8 @@ def list_finereport_inventory(db: Session = Depends(db_session)):
         results.append({"id": row.id, "report_id": row.name, "status": row.status, "owner": row.owner, **data})
     return results
 
-\n@app.get("/api/v1/records")
+
+@app.get("/api/v1/records")
 def list_records(category: str | None = None, db: Session = Depends(db_session)):
     stmt = select(Record).order_by(Record.id.desc())
     if category:
