@@ -1,0 +1,17 @@
+{
+  "reports": [
+    {
+      "report_id": "sample-report",
+      "name": "Sample report",
+      "folder": "/Demo",
+      "owner": "",
+      "datasource": "",
+      "datasets": [
+        {
+          "name": "sample_dataset",
+          "sql": "SELECT * FROM demo_table"
+        }
+      ]
+    }
+  ]
+}

@@ -324,6 +324,10 @@ class DataSourceIn(BaseModel):
     description: str = ""
 
 
+
+class FineReportImportIn(BaseModel):
+    reports: list[dict[str, Any]] = Field(min_length=1, max_length=5000)
+
 class AgentPrompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     allow_external_model: bool = False
@@ -678,6 +682,48 @@ def dashboard(db: Session = Depends(db_session)):
     counts["pending_tasks"] = db.scalar(select(func.count()).select_from(GovernanceIssue).where(
         GovernanceIssue.status != "已关闭")) or 0
     return counts
+
+
+
+@app.post("/api/v1/finereport/reports/import", status_code=200)
+def import_finereport_inventory(
+    payload: FineReportImportIn,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    """Import read-only inventory export. Records are stored as JSON in governance Records."""
+    imported = 0
+    for report in payload.reports:
+        report_id = str(report.get("report_id") or report.get("id") or "").strip()
+        name = str(report.get("name") or report.get("report_name") or "").strip()
+        if not report_id or not name:
+            raise HTTPException(422, "每个报表必须包含 report_id/id 和 name/report_name")
+        safe = {k: report.get(k) for k in ("report_id", "id", "name", "report_name", "folder", "path", "owner", "datasets", "dataset_sql", "datasource") if k in report}
+        safe["report_id"] = report_id
+        safe["name"] = name
+        serialized = json.dumps(safe, ensure_ascii=False)
+        existing = db.scalar(select(Record).where(Record.category == "finereport_report", Record.name == report_id))
+        if existing:
+            existing.description = serialized
+            existing.status = "已导入"
+            existing.owner = str(report.get("owner") or "")
+        else:
+            db.add(Record(category="finereport_report", name=report_id, description=serialized, status="已导入", owner=str(report.get("owner") or "")))
+        imported += 1
+    db.commit()
+    return {"success": True, "imported": imported, "category": "finereport_report"}
+
+@app.get("/api/v1/finereport/reports")
+def list_finereport_inventory(db: Session = Depends(db_session)):
+    rows = db.scalars(select(Record).where(Record.category == "finereport_report").order_by(Record.id.desc())).all()
+    results = []
+    for row in rows:
+        try:
+            data = json.loads(row.description or "{}")
+        except (TypeError, json.JSONDecodeError):
+            data = {}
+        results.append({"id": row.id, "report_id": row.name, "status": row.status, "owner": row.owner, **data})
+    return results
 
 
 @app.get("/api/v1/records")
