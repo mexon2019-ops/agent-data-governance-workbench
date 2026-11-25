@@ -17,7 +17,7 @@ set_value MYSQL_TEST_READER_PASSWORD "$(openssl rand -hex 32)"
 set_value AUTH_SECRET "$(openssl rand -hex 32)"
 read -r -s -p "Set bootstrap administrator password (>=16 characters): " admin
 echo
-if [[ ${#admin} -lt 16 ]]; then echo "FAIL: password must be at least 16 characters"; rm -f .env; exit 1; fi
+if [[ ${#admin} -lt 16 || "$admin" == *"|"* || "$admin" == *$"\\n"* ]]; then echo "FAIL: password must be at least 16 characters and must not contain | or newlines"; rm -f .env; exit 1; fi
 set_value BOOTSTRAP_ADMIN_PASSWORD "$admin"
 unset admin
 chmod 600 .env
