@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.."\nbash scripts/preflight-preview.sh
 command -v docker >/dev/null || { echo "ERROR: Docker not installed"; exit 1; }
 docker compose version >/dev/null || { echo "ERROR: Docker Compose plugin unavailable"; exit 1; }
 [[ -f .env ]] || { echo "ERROR: .env missing; copy .env.example and configure"; exit 1; }
