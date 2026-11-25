@@ -1507,6 +1507,57 @@ def quality_rule_public(row: QualityRule):
     }
 
 
+@app.get("/api/v1/governance/classification-suggestions")
+def governance_classification_suggestions(limit: int = 500, db: Session = Depends(db_session)):
+    """Metadata-only batch classification suggestions; never reads business rows."""
+    from .classification_service import suggest_field_classification
+    limit = max(1, min(limit, 2000))
+    columns = db.scalars(select(MetadataColumn).order_by(MetadataColumn.id).limit(limit)).all()
+    result = []
+    for column in columns:
+        table = db.get(MetadataTable, column.table_id)
+        result.append({"column_id": column.id, "table_id": column.table_id,
+            "schema_name": table.schema_name if table else "", "table_name": table.table_name if table else "",
+            "column_name": column.column_name, "data_type": column.data_type,
+            "current_level": column.sensitivity_level,
+            "suggestion": suggest_field_classification(column.column_name, column.data_type)})
+    return {"count": len(result), "limit": limit, "suggestions": result,
+        "notice": "仅元数据字段名与类型推断建议，需人工审核；不读取业务数据行。"}
+
+@app.get("/api/v1/governance/standard-rule-preview")
+def governance_standard_rule_preview(db: Session = Depends(db_session)):
+    """Preview rule candidates from approved mappings to published standards; no writes."""
+    versions = db.scalars(select(DataStandardVersion).where(DataStandardVersion.status == "已发布")).all()
+    candidates = []
+    for version in versions:
+        standard = db.get(DataStandard, version.standard_id)
+        for mapping in version.mappings:
+            if mapping.mapping_status not in {"已确认", "已核验", "确认"}:
+                continue
+            column = db.get(MetadataColumn, mapping.metadata_column_id)
+            table = db.get(MetadataTable, column.table_id) if column else None
+            if not column or not table:
+                continue
+            if version.required:
+                candidates.append({"candidate_code": f"STD-{version.id}-{column.id}-COMP",
+                    "name": f"{standard.name if standard else '标准'} - 完整性检查",
+                    "rule_type": "completeness", "severity": "中", "threshold_rate": 100,
+                    "config": {}, "table_id": table.id, "column_id": column.id,
+                    "standard_version_id": version.id, "enabled": False})
+            rng = (version.value_range or "").strip()
+            # Deliberately accept only simple numeric ranges; never execute arbitrary expressions.
+            import re
+            match = re.fullmatch(r"\\s*(-?\\d+(?:\\.\\d+)?)\\s*(?:~|至|-)\\s*(-?\\d+(?:\\.\\d+)?)\\s*", rng)
+            if match and column.data_type.lower().find("char") == -1 and column.data_type.lower().find("text") == -1:
+                candidates.append({"candidate_code": f"STD-{version.id}-{column.id}-RANGE",
+                    "name": f"{standard.name if standard else '标准'} - 范围检查",
+                    "rule_type": "range", "severity": "中", "threshold_rate": 100,
+                    "config": {"min": float(match.group(1)), "max": float(match.group(2))},
+                    "table_id": table.id, "column_id": column.id,
+                    "standard_version_id": version.id, "enabled": False})
+    return {"count": len(candidates), "candidates": candidates,
+        "notice": "只生成候选预览，不创建或启用规则；仅依据已发布标准和已确认映射。"}
+
 @app.get("/api/v1/quality/rules")
 def list_quality_rules(
     keyword: str | None = None,
