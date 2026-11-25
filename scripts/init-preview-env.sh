@@ -10,7 +10,7 @@ command -v openssl >/dev/null || { echo "FAIL: openssl is required"; exit 1; }
 [[ -f .env.example ]] || { echo "FAIL: .env.example missing"; exit 1; }
 cp .env.example .env
 # Generate unique secrets for database and application signing.
-set_value(){ local key="$1" value="$2"; sed -i "s|^${key}=.*|${key}=${value}|" .env; }
+set_value(){ local key="$1" value="$2" escaped; escaped="${value//\\/\\\\}"; escaped="${escaped//&/\\&}"; escaped="${escaped//|/\\|}"; sed -i "s|^${key}=.*|${key}=${escaped}|" .env; }
 set_value POSTGRES_PASSWORD "$(openssl rand -hex 32)"
 set_value MYSQL_TEST_ROOT_PASSWORD "$(openssl rand -hex 32)"
 set_value MYSQL_TEST_READER_PASSWORD "$(openssl rand -hex 32)"
