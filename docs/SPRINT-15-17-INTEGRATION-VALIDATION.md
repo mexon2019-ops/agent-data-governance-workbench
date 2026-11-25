@@ -52,3 +52,11 @@ Create: `POST /api/v1/quality/rules/from-standard-mappings`
 - [ ] Validate Docker Compose clean startup and Alembic migration.
 - [ ] Smoke test UI: login, report inventory, lineage preview, standard candidate review, coverage.
 - [ ] Recheck PR base/head ordering; merge Sprint 13 before Sprint 14/15 dependency.
+
+
+## Implementation status update (2026-11-25)
+- Sprint 15: negative review revokes active mappings; coverage report display name reads imported inventory JSON. Commit: 8d8815c.
+- Sprint 15 UI: FineReport report table has field standard governance entry; candidate listing, positive/negative review actions, and coverage display integrated. Commit: c76398b.
+- Sprint 16 overview endpoint implemented: GET /api/v1/governance/overview.
+- Sprint 17 standard-derived rule preview and creation implemented: GET /api/v1/quality/rules/standard-preview and POST /api/v1/quality/rules/from-standard-mappings. Created rules default disabled.
+- These code changes are committed to the Sprint 14 branch; CI and runtime validation are still pending. Do not consider the features release-ready until regression gates below pass.
