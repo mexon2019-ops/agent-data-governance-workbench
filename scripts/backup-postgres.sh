@@ -8,8 +8,14 @@ mkdir -p "$backup_dir"
 chmod 700 "$backup_dir"
 stamp="$(date +%Y%m%d-%H%M%S)"
 file="$backup_dir/data_governance-$stamp.sql.gz"
-docker compose exec -T postgres pg_dump -U dg_user -d data_governance --no-owner --no-privileges | gzip -c > "$file"
-chmod 600 "$file"
-[[ -s "$file" ]] || { echo "ERROR: backup file empty"; exit 1; }
-echo "Backup created: $file"
+tmp="$(mktemp "$backup_dir/.backup-$stamp-XXXXXX")"
+cleanup(){ rm -f "$tmp"; }
+trap cleanup EXIT
+docker compose exec -T postgres pg_dump -U dg_user -d data_governance --no-owner --no-privileges | gzip -c > "$tmp"
+[[ -s "$tmp" ]] || { echo "ERROR: backup file empty" >&2; exit 1; }
+gzip -t "$tmp"
+chmod 600 "$tmp"
+mv "$tmp" "$file"
+trap - EXIT
+echo "Backup created and gzip integrity checked: $file"
 echo "IMPORTANT: restoration testing is still required; store a copy in a separate protected location."
