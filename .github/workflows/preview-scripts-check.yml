@@ -20,7 +20,8 @@ jobs:
           bash -n scripts/health-check.sh
           bash -n scripts/backup-postgres.sh
           bash -n scripts/diagnose.sh
-          bash -n scripts/start-mysql-test.sh\n          bash -n scripts/preflight-preview.sh
+          bash -n scripts/start-mysql-test.sh
+          bash -n scripts/preflight-preview.sh
       - name: Compose configuration validation
         run: |
           cp .env.example .env
