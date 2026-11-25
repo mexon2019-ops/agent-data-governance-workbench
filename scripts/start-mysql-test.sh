@@ -4,9 +4,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 if [[ ! -f .env ]]; then echo ".env missing; copy .env.example and configure secrets." >&2; exit 1; fi
 chmod 600 .env
-set -a; source .env; set +a
+# Avoid sourcing .env as shell code; inspect required values as text.
 for name in MYSQL_TEST_ROOT_PASSWORD MYSQL_TEST_READER_PASSWORD; do
- value="${!name:-}"
+ value="$(awk -F= -v key="$name" '$1==key {sub(/^[^=]*=/,""); print; exit}' .env | tr -d '\r')"
  if [[ -z "$value" || "$value" == *"change-this"* || "$value" == *"replace-with"* ]]; then echo "Set non-placeholder $name in .env." >&2; exit 1; fi
 done
 docker compose --profile mysql-test config --quiet
