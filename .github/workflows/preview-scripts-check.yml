@@ -6,6 +6,7 @@ on:
       - "scripts/**"
       - "docker-compose.yml"
       - ".env.example"
+      - "docs/**"
       - ".github/workflows/preview-scripts-check.yml"
 
 jobs:
@@ -19,7 +20,9 @@ jobs:
           bash -n scripts/health-check.sh
           bash -n scripts/backup-postgres.sh
           bash -n scripts/diagnose.sh
+          bash -n scripts/start-mysql-test.sh
       - name: Compose configuration validation
         run: |
           cp .env.example .env
           docker compose config --quiet
+          docker compose --profile mysql-test config --quiet
