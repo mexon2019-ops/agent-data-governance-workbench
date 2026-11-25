@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import hashlib
 import hmac
@@ -2185,3 +2186,76 @@ def finereport_standard_coverage(report_id:str|None=None,_user:User=Depends(requ
             "unmapped_count":total-count,"coverage_rate":round(count/total*100,2) if total else 0,
             "unmapped_columns":[{"column_id":c.id,"table_id":c.table_id,"column_name":c.column_name} for c in cols if c.id not in mapped]})
     return out
+
+@app.get("/api/v1/governance/overview")
+def s16_governance_overview(_user: User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    issues=db.scalars(select(GovernanceIssue)).all()
+    now=datetime.utcnow()
+    active=[i for i in issues if i.status!="已关闭"]
+    closed=[i for i in issues if i.status=="已关闭"]
+    overdue=[i for i in active if i.due_date and i.due_date<now]
+    runs=db.scalars(select(QualityRun).order_by(QualityRun.id.desc())).all()
+    latest_issues=sorted(issues,key=lambda i:i.updated_at or i.created_at or now,reverse=True)[:10]
+    def grouped(items,key):
+        result={}
+        for item in items: result[str(key(item) or "未指定")]=result.get(str(key(item) or "未指定"),0)+1
+        return result
+    return {"issue_total":len(issues),"active_count":len(active),"closed_count":len(closed),
+        "overdue_count":len(overdue),"closure_rate":round(len(closed)/len(issues)*100,2) if issues else 0,
+        "status_distribution":grouped(issues,lambda i:i.status),
+        "severity_distribution":grouped(issues,lambda i:i.severity),
+        "department_distribution":grouped(active,lambda i:i.owner_department),
+        "quality_runs":{"total":len(runs),"success":sum(1 for r in runs if r.status in ("成功","完成") and r.passed),
+            "failed":sum(1 for r in runs if r.status in ("失败","异常") or not r.passed)},
+        "latest_issues":[{"id":i.id,"issue_code":i.issue_code,"title":i.title,"severity":i.severity,
+            "owner_department":i.owner_department,"owner":i.owner,"status":i.status,"due_date":i.due_date,
+            "updated_at":i.updated_at} for i in latest_issues]}
+
+def _s17_rule_candidates(db:Session):
+    mappings=db.scalars(select(DataStandardMapping).where(DataStandardMapping.mapping_status=="已落标")).all()
+    candidates=[]
+    for mapping in mappings:
+        col=db.get(MetadataColumn,mapping.metadata_column_id)
+        version=db.get(DataStandardVersion,mapping.version_id)
+        standard=db.get(DataStandard,version.standard_id) if version else None
+        table=db.get(MetadataTable,col.table_id) if col else None
+        if not col or not version or not standard or standard.status!="已发布" or version.status!="已发布" or not table: continue
+        rule_type=None; config={}
+        if version.required: rule_type="completeness"
+        else:
+            match=re.search(r"^\s*(-?\d+(?:\.\d+)?)\s*(?:~|至|到|,|-)\s*(-?\d+(?:\.\d+)?)\s*$",version.value_range or "")
+            if match:
+                rule_type="range"; config={"min":float(match.group(1)),"max":float(match.group(2))}
+        if not rule_type: continue
+        rule_code=f"STD_{version.id}_{col.id}_{rule_type.upper()}"
+        existing=db.scalar(select(QualityRule).where(QualityRule.rule_code==rule_code))
+        candidates.append({"rule_code":rule_code,"name":f"{standard.name}-{col.column_name}-{('非空检查' if rule_type=='completeness' else '范围检查')}",
+            "metadata_table_id":table.id,"metadata_column_id":col.id,"standard_version_id":version.id,
+            "rule_type":rule_type,"severity":"中","threshold_rate":100.0,"config":config,
+            "existing":bool(existing),"enabled":existing.enabled if existing else False})
+    return candidates
+
+@app.get("/api/v1/quality/rules/standard-preview")
+def s17_standard_preview(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    return {"candidates":_s17_rule_candidates(db),"note":"候选规则仅依据已落标且已发布标准的明确约束；规则默认停用，需人工启用。"}
+
+class S17CreateRulesIn(BaseModel):
+    rule_codes:list[str]=Field(min_length=1,max_length=500)
+
+@app.post("/api/v1/quality/rules/from-standard-mappings")
+def s17_create_rules(payload:S17CreateRulesIn,_user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    candidates=_s17_rule_candidates(db)
+    chosen={c["rule_code"]:c for c in candidates}
+    if any(code not in chosen for code in payload.rule_codes): raise HTTPException(422,"选择的规则编码不属于当前有效候选清单")
+    created=[]; existing=[]
+    for code in dict.fromkeys(payload.rule_codes):
+        item=chosen[code]
+        row=db.scalar(select(QualityRule).where(QualityRule.rule_code==code))
+        if row: existing.append(code); continue
+        row=QualityRule(rule_code=code,name=item["name"],metadata_table_id=item["metadata_table_id"],
+            metadata_column_id=item["metadata_column_id"],standard_version_id=item["standard_version_id"],
+            rule_type=item["rule_type"],severity=item["severity"],threshold_rate=item["threshold_rate"],
+            config=json.dumps(item["config"],ensure_ascii=False),enabled=False)
+        db.add(row); created.append(code)
+    db.commit()
+    return {"created":created,"existing":existing,"created_count":len(created),"enabled_by_default":False}
