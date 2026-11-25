@@ -2140,6 +2140,14 @@ def finereport_standard_review(report_id:str,payload:FineReportStandardReviewIn,
             mapping.mapping_status="已落标"; mapping.note=payload.note; mapping.mapped_at=datetime.utcnow()
         else:
             db.add(DataStandardMapping(version_id=version.id,metadata_column_id=column.id,mapping_status="已落标",note=payload.note))
+    else:
+        # Explicit rejection revokes any previously active mapping for this column.
+        active_mappings=db.scalars(select(DataStandardMapping).where(
+            DataStandardMapping.metadata_column_id==column.id,
+            DataStandardMapping.mapping_status=="已落标")).all()
+        for active_mapping in active_mappings:
+            active_mapping.mapping_status="已撤销"
+            active_mapping.note=payload.note
     ledger={"report_id":report_id,"metadata_column_id":column.id,"column_name":column.column_name,
         "table_id":column.table_id,"standard_id":standard.id,"standard_code":standard.standard_code,
         "standard_name":standard.name,"standard_version_id":version.id,"version_number":version.version_number,
@@ -2168,7 +2176,12 @@ def finereport_standard_coverage(report_id:str|None=None,_user:User=Depends(requ
         for (rid,cid),d in review_latest.items():
             if rid==r.name and d.get("decision")=="已落标" and cid in {c.id for c in cols}: mapped.add(cid)
         total=len(cols); count=len(mapped)
-        out.append({"report_id":r.name,"report_name":r.description,"column_count":total,"mapped_count":count,
+        try:
+            inventory=json.loads(r.description or "{}")
+        except (TypeError,json.JSONDecodeError):
+            inventory={}
+        report_name=inventory.get("name") or inventory.get("report_name") or r.name
+        out.append({"report_id":r.name,"report_name":report_name,"column_count":total,"mapped_count":count,
             "unmapped_count":total-count,"coverage_rate":round(count/total*100,2) if total else 0,
             "unmapped_columns":[{"column_id":c.id,"table_id":c.table_id,"column_name":c.column_name} for c in cols if c.id not in mapped]})
     return out
