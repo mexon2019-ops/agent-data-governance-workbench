@@ -2604,3 +2604,43 @@ def governance_tasks_department_summary(_user:User=Depends(require_permission("g
     for item in grouped.values():
         item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
     return {"departments":sorted(grouped.values(),key=lambda x:(-x["overdue"],-x["pending"],x["department"]))}
+
+
+# Sprint 117-122: task operations overview aggregation (read-only, bounded detail-free output).
+@app.get("/api/v1/governance/tasks-operations-overview")
+def governance_tasks_operations_overview(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceTask)).all()
+    now=datetime.utcnow()
+    by_source={}
+    by_status={}
+    by_priority={}
+    by_department={}
+    aging={"0-7_days":0,"8-30_days":0,"31-90_days":0,"over_90_days":0}
+    unassigned=0
+    overdue=0
+    closed=0
+    for task in rows:
+        by_source[task.source_type or "unknown"]=by_source.get(task.source_type or "unknown",0)+1
+        by_status[task.status or "unknown"]=by_status.get(task.status or "unknown",0)+1
+        priority=_task_priority(task)
+        by_priority[priority]=by_priority.get(priority,0)+1
+        dept=task.owner_department.strip() or "未分配部门"
+        by_department[dept]=by_department.get(dept,0)+1
+        unassigned+=int(not task.owner.strip())
+        closed+=int(task.status=="已关闭")
+        overdue+=int(task.status!="已关闭" and task.due_date is not None and task.due_date<now)
+        age=max(0,(now-task.created_at).days) if task.created_at else 0
+        if age<=7: aging["0-7_days"]+=1
+        elif age<=30: aging["8-30_days"]+=1
+        elif age<=90: aging["31-90_days"]+=1
+        else: aging["over_90_days"]+=1
+    total=len(rows)
+    return {"generated_at":now,"scope":"all governance tasks; counts only",
+        "total":total,"closed":closed,"overdue":overdue,"unassigned_owner":unassigned,
+        "closure_rate":round(closed/total*100,2) if total else 0,
+        "by_source":dict(sorted(by_source.items())),
+        "by_status":dict(sorted(by_status.items())),
+        "by_priority":dict(sorted(by_priority.items())),
+        "by_department":dict(sorted(by_department.items())),
+        "aging_buckets":aging,
+        "disclaimer":"Operational aggregation only; not an HR or departmental performance rating."}
