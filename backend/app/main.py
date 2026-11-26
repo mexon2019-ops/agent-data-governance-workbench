@@ -2799,3 +2799,33 @@ def governance_tasks_acceptance_report(_user:User=Depends(require_permission("go
     returned=sum(1 for decision in reviews.values() if decision=="退回")
     reviewed=len(reviews); total=len(tasks)
     return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(event_rows)+len(legacy_rows),"scope":"优先读取专用验收事件；无专用事件任务回退读取旧Record记录。"}
+
+# Sprint 219-224: audit timeline and event-link consistency checks.
+@app.get("/api/v1/governance/tasks/{task_id}/review-history")
+def governance_task_review_history(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if task is None: raise HTTPException(404,"治理任务不存在")
+    events=db.scalars(select(GovernanceReviewEvent).where(GovernanceReviewEvent.task_id==task_id).order_by(GovernanceReviewEvent.id.desc())).all()
+    linked_ids={event.legacy_record_id for event in events if event.legacy_record_id is not None}
+    legacy=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    items=[{"event_id":event.id,"legacy_record_id":event.legacy_record_id,"decision":event.decision,"reviewer":event.reviewer,"comment":event.comment,"created_at":event.created_at,"source":"event"} for event in events]
+    for row in legacy:
+        if row.id in linked_ids: continue
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("task_id")==task_id and payload.get("decision") in ("通过","退回"):
+            items.append({"event_id":None,"legacy_record_id":row.id,"decision":payload.get("decision"),"reviewer":payload.get("reviewer") or row.owner,"comment":payload.get("comment") or "","created_at":row.created_at,"source":"legacy"})
+    items.sort(key=lambda item:(item["created_at"] or datetime.min,item["legacy_record_id"] or 0),reverse=True)
+    return {"task_id":task_id,"task_code":task.task_code,"history":items,"count":len(items)}
+
+@app.get("/api/v1/governance/review-event-integrity")
+def governance_review_event_integrity(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    events=db.scalars(select(GovernanceReviewEvent)).all()
+    task_ids=set(db.scalars(select(GovernanceTask.id)).all())
+    record_ids=set(db.scalars(select(Record.id).where(Record.category=="task_review")).all())
+    missing_task=[];missing_legacy=[];invalid=[]
+    for event in events:
+        if event.task_id not in task_ids: missing_task.append(event.id)
+        if event.legacy_record_id is not None and event.legacy_record_id not in record_ids: missing_legacy.append(event.id)
+        if event.decision not in ("通过","退回"): invalid.append(event.id)
+    return {"event_count":len(events),"orphan_task_event_ids":missing_task,"missing_legacy_record_event_ids":missing_legacy,"invalid_decision_event_ids":invalid,"integrity_ok":not(missing_task or missing_legacy or invalid)}
