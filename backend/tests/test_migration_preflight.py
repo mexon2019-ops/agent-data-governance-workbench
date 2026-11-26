@@ -49,3 +49,16 @@ def test_preflight_rejects_empty_backup_evidence(tmp_path):
         assert "empty" in str(exc)
     else:
         raise AssertionError("empty backup evidence must be rejected")
+
+
+def test_cli_json_output_is_machine_readable(tmp_path, monkeypatch, capsys):
+    import json
+    import migration_preflight
+
+    db = tmp_path / "cli.db"
+    monkeypatch.setattr("sys.argv", ["migration_preflight", "--database-url", f"sqlite:///{db}", "--json"])
+    assert migration_preflight.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ok"
+    assert output["migration_applied"] is False
+    assert "pending_revision_count" in output
