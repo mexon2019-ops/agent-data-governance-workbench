@@ -41,5 +41,8 @@ def test_review_decision_validation_and_return_path():
         assert invalid.value.status_code==422
         returned=main.review_governance_task(task.id,main.GovernanceTaskReviewIn(decision="退回",comment="补充材料"),reviewer,db)
         assert returned["decision"]=="退回"
-        db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).delete(synchronize_session=False)
+        import json
+        for row in db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all():
+            if json.loads(row.description or "{}").get("task_id")==task.id:
+                db.delete(row)
         db.delete(task);db.commit()
