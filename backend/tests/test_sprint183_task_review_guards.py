@@ -3,6 +3,18 @@ os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/sprint183-188-review-test.
 os.environ.setdefault("AUTH_SECRET", "test-only-secret-that-is-long-enough-for-ci-123456")
 from app import main
 import pytest
+import json
+
+
+def cleanup(db, task):
+    events=db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.task_id==task.id).all()
+    for event in events: db.delete(event)
+    rows=db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all()
+    for row in rows:
+        try:
+            if json.loads(row.description or "{}").get("task_id")==task.id: db.delete(row)
+        except (TypeError,json.JSONDecodeError): pass
+    db.delete(task);db.commit()
 
 
 def test_task_review_requires_evidence_and_independent_reviewer():
@@ -21,11 +33,7 @@ def test_task_review_requires_evidence_and_independent_reviewer():
         main.add_governance_task_evidence(task.id,main.GovernanceTaskEvidenceIn(title="整改证明"),worker,db)
         accepted=main.review_governance_task(task.id,main.GovernanceTaskReviewIn(decision="通过",comment="核验"),reviewer,db)
         assert accepted["decision"]=="通过"
-        review_events=db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.task_id==task.id).all()\n        for event in review_events: db.delete(event)\n        for event in db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.task_id==task.id).all(): db.delete(event)\n        for row in db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all():
-            import json
-            if json.loads(row.description or "{}").get("task_id")==task.id:
-                db.delete(row)
-        db.delete(task);db.commit()
+        cleanup(db,task)
 
 
 def test_review_decision_validation_and_return_path():
@@ -41,8 +49,4 @@ def test_review_decision_validation_and_return_path():
         assert invalid.value.status_code==422
         returned=main.review_governance_task(task.id,main.GovernanceTaskReviewIn(decision="退回",comment="补充材料"),reviewer,db)
         assert returned["decision"]=="退回"
-        import json
-        for row in db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all():
-            if json.loads(row.description or "{}").get("task_id")==task.id:
-                db.delete(row)
-        db.delete(task);db.commit()
+        cleanup(db,task)
