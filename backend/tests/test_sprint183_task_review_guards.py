@@ -1,5 +1,6 @@
 import os
-os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/sprint183-188-review-test.db")
+import uuid
+os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/sprint183-188-review-test-{uuid.uuid4().hex}.db")
 os.environ.setdefault("AUTH_SECRET", "test-only-secret-that-is-long-enough-for-ci-123456")
 from app import main
 import pytest
