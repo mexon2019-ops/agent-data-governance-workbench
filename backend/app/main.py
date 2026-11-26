@@ -2897,3 +2897,58 @@ def export_governance_task_review_history_v2(task_id:int,_user:User=Depends(requ
     for item in items: writer.writerow([item["event_id"],item["legacy_record_id"],item["decision"],item["reviewer"],item["comment"],item["created_at"],item["source"]])
     content="\\ufeff"+output.getvalue()
     return Response(content=content,media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=task-{task_id}-review-history-v2.csv"})
+
+
+# Sprint 231-236: actionable review-integrity anomaly registry (stored as governance Records).
+class ReviewIntegrityActionIn(BaseModel):
+    issue_category: str = Field(min_length=2, max_length=80)
+    issue_record_id: int = Field(ge=1)
+    status: str = Field(default="待处理", max_length=20)
+    note: str = Field(default="", max_length=4000)
+
+@app.get("/api/v1/governance/review-integrity-actions")
+def list_review_integrity_actions(limit:int=100,offset:int=0,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action").order_by(Record.id.desc())).all()
+    items=[]
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        items.append({"id":row.id,"issue_category":payload.get("issue_category"),"issue_record_id":payload.get("issue_record_id"),"status":row.status,"note":payload.get("note",""),"owner":row.owner,"created_at":row.created_at})
+    return {"items":items[offset:offset+limit],"total":len(items),"limit":limit,"offset":offset,"has_more":offset+limit<len(items)}
+
+@app.post("/api/v1/governance/review-integrity-actions",status_code=201)
+def create_review_integrity_action(payload:ReviewIntegrityActionIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    category=payload.issue_category.strip();status=payload.status.strip();note=payload.note.strip()
+    allowed=("待处理","处理中","已解决","已确认非问题")
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record"): raise HTTPException(422,"未知异常类别")
+    if status not in allowed: raise HTTPException(422,"状态值无效")
+    if payload.issue_record_id<1: raise HTTPException(422,"异常记录ID无效")
+    key={"issue_category":category,"issue_record_id":payload.issue_record_id}
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    for row in rows:
+        try: existing=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if existing.get("issue_category")==category and existing.get("issue_record_id")==payload.issue_record_id:
+            existing["note"]=note
+            row.description=json.dumps(existing,ensure_ascii=False)
+            row.status=status;row.owner=user.username
+            db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=200))
+            db.commit();db.refresh(row)
+            return {"id":row.id,**key,"status":row.status,"note":note,"owner":row.owner,"created_at":row.created_at}
+    row=Record(category="review_integrity_action",name=f"{category}:{payload.issue_record_id}",description=json.dumps({**key,"note":note},ensure_ascii=False),status=status,owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,**key,"status":row.status,"note":note,"owner":row.owner,"created_at":row.created_at}
+
+@app.get("/api/v1/governance/review-integrity-action-summary")
+def review_integrity_action_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    counts={"total":len(rows),"待处理":0,"处理中":0,"已解决":0,"已确认非问题":0}
+    by_category={}
+    for row in rows:
+        counts[row.status]=counts.get(row.status,0)+1
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): payload={}
+        cat=payload.get("issue_category","未知")
+        by_category[cat]=by_category.get(cat,0)+1
+    return {"summary":counts,"by_category":by_category,"scope":"仅统计已登记的异常处理记录；不自动修复验收事件或历史数据。"}
