@@ -2436,8 +2436,8 @@ class GovernanceTaskAction(BaseModel):
     note: str = Field(default="", max_length=4000)
 
 def _task_priority(task: GovernanceTask):
-    """Derived priority, intentionally computed without schema migration."""
-    text = (task.title + " " + task.description + " " + task.task_type).lower()
+    """Derived priority, tolerating nullable legacy task fields."""
+    text = " ".join(str(value or "") for value in (task.title, task.description, task.task_type)).lower()
     if any(k in text for k in ("高度敏感", "安全", "重大", "critical", "严重")):
         return "高"
     if task.source_type == "quality_run" or task.source_type == "asset_checklist":
