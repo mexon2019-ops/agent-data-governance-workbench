@@ -49,7 +49,11 @@ def main():
     try:
         result = preflight(args.database_url, args.backup_file)
     except Exception as exc:
-        print(f"PRE-FLIGHT FAILED: {exc}", file=sys.stderr)
+        if args.json_output:
+            import json
+            print(json.dumps({"status": "error", "migration_applied": False, "error": str(exc)}))
+        else:
+            print(f"PRE-FLIGHT FAILED: {exc}", file=sys.stderr)
         return 1
     if args.json_output:
         import json
