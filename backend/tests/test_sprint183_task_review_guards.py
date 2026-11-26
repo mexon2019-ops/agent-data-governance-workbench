@@ -21,7 +21,7 @@ def test_task_review_requires_evidence_and_independent_reviewer():
         main.add_governance_task_evidence(task.id,main.GovernanceTaskEvidenceIn(title="整改证明"),worker,db)
         accepted=main.review_governance_task(task.id,main.GovernanceTaskReviewIn(decision="通过",comment="核验"),reviewer,db)
         assert accepted["decision"]=="通过"
-        for row in db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all():
+        review_events=db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.task_id==task.id).all()\n        for event in review_events: db.delete(event)\n        for event in db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.task_id==task.id).all(): db.delete(event)\n        for row in db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all():
             import json
             if json.loads(row.description or "{}").get("task_id")==task.id:
                 db.delete(row)
