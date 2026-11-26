@@ -10,7 +10,9 @@ def test_priority_heuristic():
     low=main.GovernanceTask(task_code="L",title="完善说明",source_type="manual")
     assert main._task_priority(high)=="高"
     assert main._task_priority(medium)=="中"
-    assert main._task_priority(low)=="低"\n    legacy=main.GovernanceTask(task_code="LEGACY",title=None,description=None,task_type=None)\n    assert main._task_priority(legacy)=="低"
+    assert main._task_priority(low)=="低"
+    legacy=main.GovernanceTask(task_code="LEGACY",title=None,description=None,task_type=None)
+    assert main._task_priority(legacy)=="低"
 
 
 def test_department_summary_aggregation():
