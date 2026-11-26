@@ -19,7 +19,8 @@ const nav:{id:Page;label:string;icon:any;group:string}[]=[
  {id:'lineage',label:'数据血缘',icon:Workflow,group:'数据治理'},
  {id:'standards',label:'数据标准',icon:ShieldCheck,group:'数据治理'},
  {id:'quality',label:'数据质量',icon:Gauge,group:'数据治理'},
- {id:'tasks',label:'治理任务',icon:ListTodo,group:'运营协同'},\n {id:'analytics',label:'治理运营分析',icon:Activity,group:'运营协同'},
+ {id:'tasks',label:'治理任务',icon:ListTodo,group:'运营协同'},
+ {id:'analytics',label:'治理运营分析',icon:Activity,group:'运营协同'},
  {id:'finereport',label:'报表治理',icon:FileText,group:'数据治理'},
  {id:'agent',label:'Agent 助手',icon:Bot,group:'智能应用'}
 ];
