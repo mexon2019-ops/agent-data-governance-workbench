@@ -2369,9 +2369,9 @@ def asset_review_checklist(_user: User = Depends(require_permission("governance:
             column_ids = select(MetadataColumn.id).where(MetadataColumn.table_id == table.id)
             mappings = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.metadata_column_id.in_(column_ids))) or 0
             quality_rules = db.scalar(select(func.count(QualityRule.id)).where(QualityRule.metadata_table_id == table.id)) or 0
-        checks = {"business_definition": bool(asset.description.strip()), "owner": bool(asset.owner.strip()),
-            "department": bool(asset.owner_department.strip()), "domain": bool(asset.business_domain.strip()),
-            "classification": asset.sensitivity_level != "未分级", "standard_mapping": mappings > 0,
+        checks = {"business_definition": bool((asset.description or "").strip()), "owner": bool((asset.owner or "").strip()),
+            "department": bool((asset.owner_department or "").strip()), "domain": bool((asset.business_domain or "").strip()),
+            "classification": bool(asset.sensitivity_level and asset.sensitivity_level != "未分级"), "standard_mapping": mappings > 0,
             "quality_coverage": quality_rules > 0}
         results.append({"asset_id": asset.id, "asset_code": asset.asset_code, "name": asset.name,
             "metadata_table_id": asset.metadata_table_id, "checks": checks,
