@@ -2306,3 +2306,33 @@ def bulk_create_standard_mappings(
             "mappings": [{"id": m.id, "metadata_column_id": m.metadata_column_id,
                           "mapping_status": m.mapping_status, "note": m.note,
                           "mapped_at": m.mapped_at} for m in results]}
+
+
+# Sprint 57: explicit mapping review decision, with audit trail.
+class MappingReviewIn(BaseModel):
+    mapping_status: str
+    note: str = Field(default="", max_length=2000)
+
+@app.patch("/api/v1/standards/mappings/{mapping_id}/review")
+def review_standard_mapping(
+    mapping_id: int,
+    payload: MappingReviewIn,
+    user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    if payload.mapping_status not in {"待核验", "已落标", "不符合"}:
+        raise HTTPException(422, "审核状态无效")
+    mapping = db.get(DataStandardMapping, mapping_id)
+    if mapping is None:
+        raise HTTPException(404, "标准映射不存在")
+    before = mapping.mapping_status
+    mapping.mapping_status = payload.mapping_status
+    mapping.note = payload.note
+    mapping.mapped_at = datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()), actor=user.username, action="UPDATE",
+        resource=f"standard_mapping:{mapping_id}: {before} -> {payload.mapping_status}",
+        http_method="PATCH", path=f"/api/v1/standards/mappings/{mapping_id}/review", status_code=200))
+    db.commit()
+    db.refresh(mapping)
+    return {"mapping_id": mapping.id, "mapping_status": mapping.mapping_status,
+            "note": mapping.note, "mapped_at": mapping.mapped_at}
