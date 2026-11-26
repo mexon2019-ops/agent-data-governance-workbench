@@ -2336,3 +2336,58 @@ def review_standard_mapping(
     db.refresh(mapping)
     return {"mapping_id": mapping.id, "mapping_status": mapping.mapping_status,
             "note": mapping.note, "mapped_at": mapping.mapped_at}
+
+# Sprint 58–60: audit log query, asset review checklist and governance report.
+@app.get("/api/v1/governance/audit")
+def governance_audit(
+    actor: str | None = None, action: str | None = None, resource: str | None = None,
+    limit: int = 100, offset: int = 0,
+    _user: User = Depends(require_permission("audit:read")), db: Session = Depends(db_session),
+):
+    if limit < 1 or limit > 200 or offset < 0:
+        raise HTTPException(422, "分页参数无效")
+    query = select(AuditLog)
+    if actor: query = query.where(AuditLog.actor.contains(actor))
+    if action: query = query.where(AuditLog.action == action)
+    if resource: query = query.where(AuditLog.resource.contains(resource))
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.scalars(query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).offset(offset).limit(limit)).all()
+    return {"total": total, "limit": limit, "offset": offset, "items": [
+        {"id": r.id, "actor": r.actor, "action": r.action, "resource": r.resource,
+         "method": r.http_method, "path": r.path, "status_code": r.status_code,
+         "request_id": r.request_id, "created_at": r.created_at} for r in rows]}
+
+@app.get("/api/v1/governance/asset-review-checklist")
+def asset_review_checklist(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    assets = db.scalars(select(DataAsset).order_by(DataAsset.id)).all()
+    results = []
+    for asset in assets:
+        table = db.get(MetadataTable, asset.metadata_table_id) if asset.metadata_table_id else None
+        mappings = 0
+        quality_rules = 0
+        if table:
+            column_ids = select(MetadataColumn.id).where(MetadataColumn.table_id == table.id)
+            mappings = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.metadata_column_id.in_(column_ids))) or 0
+            quality_rules = db.scalar(select(func.count(QualityRule.id)).where(QualityRule.metadata_table_id == table.id)) or 0
+        checks = {"business_definition": bool(asset.description.strip()), "owner": bool(asset.owner.strip()),
+            "department": bool(asset.owner_department.strip()), "domain": bool(asset.business_domain.strip()),
+            "classification": asset.sensitivity_level != "未分级", "standard_mapping": mappings > 0,
+            "quality_coverage": quality_rules > 0}
+        results.append({"asset_id": asset.id, "asset_code": asset.asset_code, "name": asset.name,
+            "metadata_table_id": asset.metadata_table_id, "checks": checks,
+            "completed": sum(checks.values()), "total_checks": len(checks),
+            "completion_rate": round(sum(checks.values())/len(checks)*100),
+            "mapping_count": mappings, "quality_rule_count": quality_rules})
+    return {"items": results, "basis": "基于已登记资产和治理元数据的自动检查；不代表合规认证。"}
+
+@app.get("/api/v1/governance/review-report")
+def governance_review_report(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    checklist = asset_review_checklist(_user=_user, db=db)["items"]
+    total_assets = len(checklist)
+    incomplete = [a for a in checklist if a["completion_rate"] < 100]
+    pending = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.mapping_status == "待核验")) or 0
+    noncompliant = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.mapping_status == "不符合")) or 0
+    return {"generated_at": datetime.utcnow(), "asset_count": total_assets,
+        "checklist_complete": total_assets-len(incomplete), "checklist_incomplete": len(incomplete),
+        "pending_mappings": pending, "noncompliant_mappings": noncompliant,
+        "incomplete_assets": incomplete, "basis": "仅汇总治理元数据和流程记录；未完成的证据明确标示，报告不构成合规认定。"}
