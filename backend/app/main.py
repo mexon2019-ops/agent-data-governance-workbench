@@ -2772,7 +2772,9 @@ def review_governance_task(task_id:int,payload:GovernanceTaskReviewIn,user:User=
     if decision=="通过" and not has_evidence: raise HTTPException(409,"验收通过前必须登记整改证据")
     data={"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username}
     row=Record(category="task_review",name=f"{task.task_code}验收{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
-    db.add(row);db.flush()\n    db.add(GovernanceReviewEvent(task_id=task_id,reviewer=user.username,decision=decision,comment=payload.comment,legacy_record_id=row.id))\n    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"governance_task:{task.task_code}:review",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/reviews",status_code=201))
+    db.add(row);db.flush()
+    db.add(GovernanceReviewEvent(task_id=task_id,reviewer=user.username,decision=decision,comment=payload.comment,legacy_record_id=row.id))
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"governance_task:{task.task_code}:review",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/reviews",status_code=201))
     db.commit();db.refresh(row)
     return {"id":row.id,"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username,"created_at":row.created_at}
 
