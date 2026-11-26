@@ -41,7 +41,8 @@ def preflight(database_url: str, backup_file: str | None = None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
-    parser.add_argument("--backup-file", help="Optional path to a non-empty backup/evidence file")\n    parser.add_argument("--json", action="store_true", dest="json_output", help="Emit machine-readable JSON")
+    parser.add_argument("--backup-file", help="Optional path to a non-empty backup/evidence file")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Emit machine-readable JSON")
     args = parser.parse_args()
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
