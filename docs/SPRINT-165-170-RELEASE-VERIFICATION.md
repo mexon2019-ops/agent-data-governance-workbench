@@ -22,3 +22,9 @@
 ## Sprint 170 — Release gate
 - Require successful backend CI, frontend production build, migration rehearsal, RBAC/security review, operator walkthrough and deployment rollback plan.
 - PR #44 remains draft and unmerged.
+
+
+## Build defect found and corrected
+- Workflow run 178 added production frontend build and failed at TypeScript parsing in `frontend/src/App.tsx` navigation array due literal escaped newline sequences.
+- Corrected navigation block to use actual line breaks in commit `3b33226c28bb3aa9bf926178caf5eec443feeb4c`.
+- Re-run CI on the repaired commit is pending; do not mark frontend build as passed until workflow confirms.
