@@ -3019,3 +3019,11 @@ def create_integrity_action_review(payload:IntegrityActionReviewIn,user:User=Dep
     row=Record(category="review_integrity_action_review",name=f"异常复核{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
     db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"review_integrity_action:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-action-reviews",status_code=201));db.commit();db.refresh(row)
     return {"id":row.id,**data,"created_at":row.created_at}
+
+# Sprint 264: correlated audit-log lookup for anomaly registry operations.
+@app.get("/api/v1/governance/review-integrity-action-audit")
+def integrity_action_audit(category:str,record_id:int,limit:int=50,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or record_id<1 or limit<1 or limit>100: raise HTTPException(422,"查询参数无效")
+    resource=f"review_integrity:{category}:{record_id}"; pattern=f"%{category}:{record_id}%"
+    rows=db.scalars(select(AuditLog).where(AuditLog.resource.like(pattern)).order_by(AuditLog.id.desc()).limit(limit)).all()
+    return {"items":[{"id":row.id,"actor":row.actor,"action":row.action,"resource":row.resource,"method":row.http_method,"path":row.path,"status_code":row.status_code,"created_at":row.created_at} for row in rows],"limit":limit,"scope":"Filtered audit records for the anomaly category and ID; matching is resource-string based."}
