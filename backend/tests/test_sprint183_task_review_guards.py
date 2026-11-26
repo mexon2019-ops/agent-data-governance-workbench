@@ -8,7 +8,13 @@ import json
 
 
 def cleanup(db, task):
-    events=db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.task_id==task.id).all()
+    rows=db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all()
+    linked_ids=[]
+    for row in rows:
+        try:
+            if json.loads(row.description or "{}").get("task_id")==task.id: linked_ids.append(row.id)
+        except (TypeError,json.JSONDecodeError): pass
+    events=db.query(main.GovernanceReviewEvent).filter(main.GovernanceReviewEvent.legacy_record_id.in_(linked_ids)).all() if linked_ids else []
     for event in events: db.delete(event)
     rows=db.query(main.Record).filter(main.Record.category.in_(["task_evidence","task_review"])).all()
     for row in rows:
@@ -21,7 +27,7 @@ def cleanup(db, task):
 def test_task_review_requires_evidence_and_independent_reviewer():
     main.Base.metadata.create_all(main.engine)
     with main.SessionLocal() as db:
-        task=main.GovernanceTask(task_code="S183-REVIEW",title="Review flow",status="处理中",owner="worker")
+        task=main.GovernanceTask(task_code="S183-REVIEW-"+uuid.uuid4().hex[:8],title="Review flow",status="处理中",owner="worker")
         db.add(task);db.commit();db.refresh(task)
         worker=type("UserFixture",(),{"username":"worker"})()
         reviewer=type("UserFixture",(),{"username":"reviewer"})()
@@ -40,7 +46,7 @@ def test_task_review_requires_evidence_and_independent_reviewer():
 def test_review_decision_validation_and_return_path():
     main.Base.metadata.create_all(main.engine)
     with main.SessionLocal() as db:
-        task=main.GovernanceTask(task_code="S183-RETURN",title="Return flow",status="处理中",owner="owner")
+        task=main.GovernanceTask(task_code="S183-RETURN-"+uuid.uuid4().hex[:8],title="Return flow",status="处理中",owner="owner")
         db.add(task);db.commit();db.refresh(task)
         owner=type("UserFixture",(),{"username":"owner"})()
         reviewer=type("UserFixture",(),{"username":"reviewer"})()
