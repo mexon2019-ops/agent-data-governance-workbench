@@ -76,4 +76,4 @@ def test_cli_json_error_is_machine_readable(tmp_path, monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "error"
     assert output["migration_applied"] is False
-    assert "backup evidence" in output["error"]
+    assert "backup evidence" in output["error"].lower()
