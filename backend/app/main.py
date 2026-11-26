@@ -2459,13 +2459,14 @@ def create_governance_task(payload: GovernanceTaskCreate,
 
 @app.get("/api/v1/governance/tasks")
 def list_governance_tasks(status: str | None = None, task_type: str | None = None,
-    owner_department: str | None = None, limit: int = 100, offset: int = 0,
+    owner_department: str | None = None, owner: str | None = None, limit: int = 100, offset: int = 0,
     _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效")
     query=select(GovernanceTask)
     if status: query=query.where(GovernanceTask.status==status)
     if task_type: query=query.where(GovernanceTask.task_type==task_type)
     if owner_department: query=query.where(GovernanceTask.owner_department.contains(owner_department))
+    if owner: query=query.where(GovernanceTask.owner.contains(owner))
     total=db.scalar(select(func.count()).select_from(query.subquery())) or 0
     tasks=db.scalars(query.order_by(GovernanceTask.updated_at.desc(),GovernanceTask.id.desc()).offset(offset).limit(limit)).all()
     return {"total":total,"limit":limit,"offset":offset,"items":[_task_public(t) for t in tasks]}
