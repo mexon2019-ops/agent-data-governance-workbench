@@ -2845,3 +2845,55 @@ def export_governance_task_review_history(task_id:int,_user:User=Depends(require
         writer.writerow([task_id,history["task_code"],item["event_id"],item["legacy_record_id"],item["decision"],item["reviewer"],item["comment"],item["created_at"],item["source"]])
     csv_content="\\ufeff"+output.getvalue()
     return Response(content=csv_content,media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=task-{task_id}-review-history.csv"})
+
+
+# Sprint 225-230: paginated integrity diagnostics and larger bounded CSV export.
+@app.get("/api/v1/governance/review-event-integrity-expanded")
+def governance_review_event_integrity_expanded(limit:int=100,offset:int=0,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效：limit 为 1-200，offset 必须大于等于 0")
+    events=db.scalars(select(GovernanceReviewEvent).order_by(GovernanceReviewEvent.id.desc())).all()
+    tasks=set(db.scalars(select(GovernanceTask.id)).all())
+    records=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    record_ids={row.id for row in records};record_payloads={};invalid_records=[]
+    for row in records:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): invalid_records.append(row.id);continue
+        tid=payload.get("task_id");decision=payload.get("decision")
+        if isinstance(tid,int) and decision in ("通过","退回"): record_payloads[row.id]=payload
+    missing_task=[];missing_record=[];invalid_decision=[];duplicate_task_decisions=[];seen_task_decisions=set()
+    for event in events:
+        if event.task_id not in tasks: missing_task.append(event.id)
+        if event.legacy_record_id is not None and event.legacy_record_id not in record_ids: missing_record.append(event.id)
+        if event.decision not in ("通过","退回"): invalid_decision.append(event.id)
+        if event.task_id in seen_task_decisions: duplicate_task_decisions.append(event.id)
+        seen_task_decisions.add(event.task_id)
+    linked={event.legacy_record_id for event in events if event.legacy_record_id is not None}
+    unlinked_legacy=[rid for rid in record_payloads if rid not in linked]
+    issues=[]
+    for category,ids in (("orphan_task_event",missing_task),("missing_legacy_link",missing_record),("invalid_event_decision",invalid_decision),("duplicate_task_event",duplicate_task_decisions),("unlinked_legacy_review",unlinked_legacy),("malformed_legacy_record",invalid_records)):
+        issues.extend({"category":category,"record_id":rid} for rid in ids)
+    return {"event_count":len(events),"legacy_review_records":len(records),"issue_count":len(issues),"issues":issues[offset:offset+limit],"limit":limit,"offset":offset,"has_more":offset+limit<len(issues),"scope":"Read-only diagnostic; no automatic repair or deletion."}
+
+@app.get("/api/v1/governance/tasks/{task_id}/review-history/export-v2")
+def export_governance_task_review_history_v2(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if task is None: raise HTTPException(404,"治理任务不存在")
+    events=db.scalars(select(GovernanceReviewEvent).where(GovernanceReviewEvent.task_id==task_id).order_by(GovernanceReviewEvent.id.desc())).all()
+    linked_ids={event.legacy_record_id for event in events if event.legacy_record_id is not None}
+    legacy=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    items=[{"event_id":event.id,"legacy_record_id":event.legacy_record_id,"decision":event.decision,"reviewer":event.reviewer,"comment":event.comment,"created_at":event.created_at,"source":"event"} for event in events]
+    for row in legacy:
+        if row.id in linked_ids: continue
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("task_id")==task_id and payload.get("decision") in ("通过","退回"):
+            items.append({"event_id":None,"legacy_record_id":row.id,"decision":payload.get("decision"),"reviewer":payload.get("reviewer") or row.owner,"comment":payload.get("comment") or "","created_at":row.created_at,"source":"legacy"})
+    items.sort(key=lambda item:(item["created_at"] or datetime.min,item["legacy_record_id"] or 0),reverse=True)
+    if len(items)>2000: raise HTTPException(422,"该任务验收记录超过2000条，需通过分页历史接口分段获取")
+    import csv,io
+    output=io.StringIO(newline="");writer=csv.writer(output)
+    writer.writerow(["export_generated_at",datetime.utcnow().isoformat(),"task_id",task_id,"task_code",task.task_code])
+    writer.writerow(["event_id","legacy_record_id","decision","reviewer","comment","created_at","source"])
+    for item in items: writer.writerow([item["event_id"],item["legacy_record_id"],item["decision"],item["reviewer"],item["comment"],item["created_at"],item["source"]])
+    content="\\ufeff"+output.getvalue()
+    return Response(content=content,media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=task-{task_id}-review-history-v2.csv"})
