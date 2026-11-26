@@ -27,3 +27,10 @@ Move the asset/standard mapping experience toward review-ready operation without
 - Validate inputs, paginate large queues, and test both positive and negative paths.
 - LLM remains optional and opt-in; send only redacted summary data.
 - Manual review is required for publication, classification and closure.
+
+
+## Sprint 53 UI increment (committed)
+- Added a dedicated `标准映射审核` navigation page.
+- Displays standard/version, source/table, field/type, mapping status, notes and timestamp.
+- Filters by mapping status and paginates in 100-row increments using the review-queue API.
+- Read-only view: no approval mutation is exposed yet; status changes remain outside this page until the audit-backed review action is implemented.
