@@ -63,3 +63,17 @@ def test_cli_json_output_is_machine_readable(tmp_path, monkeypatch, capsys):
     assert output["status"] == "ok"
     assert output["migration_applied"] is False
     assert "pending_revision_count" in output
+
+
+def test_cli_json_error_is_machine_readable(tmp_path, monkeypatch, capsys):
+    import json
+    import migration_preflight
+
+    db = tmp_path / "error.db"
+    missing = tmp_path / "missing-backup.txt"
+    monkeypatch.setattr("sys.argv", ["migration_preflight", "--database-url", f"sqlite:///{db}", "--backup-file", str(missing), "--json"])
+    assert migration_preflight.main() == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "error"
+    assert output["migration_applied"] is False
+    assert "backup evidence" in output["error"]
