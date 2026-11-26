@@ -8,7 +8,8 @@ from app import main
 def test_review_event_table_and_dual_write_are_linked():
     main.Base.metadata.create_all(main.engine)
     with main.SessionLocal() as db:
-        task=main.GovernanceTask(task_code="S207-EVENT",title="Event table",status="处理中",owner="worker")
+        baseline=main.governance_tasks_acceptance_report(_user=None,db=db)
+        task=main.GovernanceTask(task_code="S207-EVENT-"+uuid.uuid4().hex[:8],title="Event table",status="处理中",owner="worker")
         db.add(task);db.commit();db.refresh(task)
         worker=type("UserFixture",(),{"username":"worker"})()
         reviewer=type("UserFixture",(),{"username":"reviewer"})()
@@ -19,7 +20,7 @@ def test_review_event_table_and_dual_write_are_linked():
         assert event.reviewer=="reviewer"
         assert event.legacy_record_id==result["id"]
         report=main.governance_tasks_acceptance_report(_user=None,db=db)
-        assert report["accepted_tasks"]==1
+        assert report["accepted_tasks"]==baseline["accepted_tasks"]+1
         event_id=event.id
         record_id=result["id"]
         evidence_rows=db.query(main.Record).filter(main.Record.category=="task_evidence").all()
