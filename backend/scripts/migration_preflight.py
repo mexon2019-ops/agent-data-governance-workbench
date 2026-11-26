@@ -51,10 +51,14 @@ def main():
     except Exception as exc:
         print(f"PRE-FLIGHT FAILED: {exc}", file=sys.stderr)
         return 1
-    print("PRE-FLIGHT OK")
-    for key, value in result.items():
-        print(f"{key}: {value}")
-    print("No migrations were applied. Take and verify a database backup before upgrade.")
+    if args.json_output:
+        import json
+        print(json.dumps({"status": "ok", "migration_applied": False, **result}, default=str))
+    else:
+        print("PRE-FLIGHT OK")
+        for key, value in result.items():
+            print(f"{key}: {value}")
+        print("No migrations were applied. Take and verify a database backup before upgrade.")
     return 0
 
 
