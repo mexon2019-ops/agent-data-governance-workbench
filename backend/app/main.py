@@ -2435,9 +2435,18 @@ class GovernanceTaskUpdate(BaseModel):
 class GovernanceTaskAction(BaseModel):
     note: str = Field(default="", max_length=4000)
 
+def _task_priority(task: GovernanceTask):
+    """Derived priority, intentionally computed without schema migration."""
+    text = (task.title + " " + task.description + " " + task.task_type).lower()
+    if any(k in text for k in ("高度敏感", "安全", "重大", "critical", "严重")):
+        return "高"
+    if task.source_type == "quality_run" or task.source_type == "asset_checklist":
+        return "中"
+    return "低"
+
 def _task_public(task: GovernanceTask):
     return {"id":task.id,"task_code":task.task_code,"title":task.title,"task_type":task.task_type,
-        "source_type":task.source_type,"source_id":task.source_id,"description":task.description,
+        "priority":_task_priority(task),"source_type":task.source_type,"source_id":task.source_id,"description":task.description,
         "action_plan":task.action_plan,"owner":task.owner,"owner_department":task.owner_department,
         "created_by":task.created_by,"status":task.status,"due_date":task.due_date,
         "close_note":task.close_note,"created_at":task.created_at,"updated_at":task.updated_at,
@@ -2459,7 +2468,7 @@ def create_governance_task(payload: GovernanceTaskCreate,
 
 @app.get("/api/v1/governance/tasks")
 def list_governance_tasks(status: str | None = None, task_type: str | None = None,
-    owner_department: str | None = None, owner: str | None = None, limit: int = 100, offset: int = 0,
+    owner_department: str | None = None, owner: str | None = None, priority: str | None = None, limit: int = 100, offset: int = 0,
     _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
     if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效")
     query=select(GovernanceTask)
@@ -2467,6 +2476,7 @@ def list_governance_tasks(status: str | None = None, task_type: str | None = Non
     if task_type: query=query.where(GovernanceTask.task_type==task_type)
     if owner_department: query=query.where(GovernanceTask.owner_department.contains(owner_department))
     if owner: query=query.where(GovernanceTask.owner.contains(owner))
+    if priority: query=query.where(GovernanceTask.title.contains(priority)) # lightweight backward-compatible filter; priority is derived
     total=db.scalar(select(func.count()).select_from(query.subquery())) or 0
     tasks=db.scalars(query.order_by(GovernanceTask.updated_at.desc(),GovernanceTask.id.desc()).offset(offset).limit(limit)).all()
     return {"total":total,"limit":limit,"offset":offset,"items":[_task_public(t) for t in tasks]}
@@ -2576,3 +2586,22 @@ def governance_tasks_summary(_user:User=Depends(require_permission("governance:r
         "in_progress":sum(t.status=="处理中" for t in rows),"closed":sum(t.status=="已关闭" for t in rows),
         "overdue":sum(t.status!="已关闭" and t.due_date and t.due_date<datetime.utcnow() for t in rows),
         "closure_rate":round(sum(t.status=="已关闭" for t in rows)/len(rows)*100,2) if rows else 0}
+
+# Sprint 109–110: department-level task execution metrics.
+@app.get("/api/v1/governance/tasks-department-summary")
+def governance_tasks_department_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceTask)).all()
+    grouped={}
+    now=datetime.utcnow()
+    for task in rows:
+        dept=task.owner_department.strip() or "未分配部门"
+        item=grouped.setdefault(dept,{"department":dept,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0,"high_priority":0})
+        item["total"]+=1
+        item["pending"]+=int(task.status=="待处理")
+        item["in_progress"]+=int(task.status=="处理中")
+        item["closed"]+=int(task.status=="已关闭")
+        item["overdue"]+=int(task.status!="已关闭" and task.due_date is not None and task.due_date<now)
+        item["high_priority"]+=int(_task_priority(task)=="高")
+    for item in grouped.values():
+        item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
+    return {"departments":sorted(grouped.values(),key=lambda x:(-x["overdue"],-x["pending"],x["department"]))}
