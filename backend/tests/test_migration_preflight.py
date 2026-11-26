@@ -22,7 +22,8 @@ def test_preflight_reports_head_and_pending_for_unversioned_database(tmp_path):
     assert result["pending_revision_count"] > 0
 
 
-def test_preflight_reports_zero_pending_after_upgrade(tmp_path):
+def test_preflight_reports_zero_pending_after_upgrade(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     db = tmp_path / "upgraded.db"
     url = f"sqlite:///{db}"
     upgrade(alembic_config(url), "head")
