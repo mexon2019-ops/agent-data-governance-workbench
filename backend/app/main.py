@@ -2209,3 +2209,62 @@ def governance_trends(_user: User = Depends(require_permission("governance:read"
         closed = db.scalar(select(func.count(GovernanceIssue.id)).where(GovernanceIssue.closed_at >= start, GovernanceIssue.closed_at < end)) or 0
         buckets.append({"month": start.strftime("%Y-%m"), "created": created, "closed": closed})
     return {"months": buckets, "basis": "按治理问题创建时间及关闭时间统计；不回溯历史状态，仅使用治理问题记录。"}
+
+
+# Sprint 52: bulk standard-field mapping endpoint.
+@app.post("/api/v1/standards/{standard_id}/versions/{version_id}/mappings/bulk", status_code=201)
+def bulk_create_standard_mappings(
+    standard_id: int,
+    version_id: int,
+    payload: dict,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    """Create or update a bounded batch of mappings for one standard version."""
+    version = db.get(DataStandardVersion, version_id)
+    if not version or version.standard_id != standard_id:
+        raise HTTPException(404, "标准版本不存在")
+    items = payload.get("mappings")
+    if not isinstance(items, list) or not items or len(items) > 500:
+        raise HTTPException(422, "mappings 必须为 1-500 条记录的数组")
+    allowed_statuses = {"待核验", "已落标", "不符合"}
+    normalized = []
+    seen_column_ids = set()
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("metadata_column_id"), int):
+            raise HTTPException(422, "每条映射必须包含整数 metadata_column_id")
+        column_id = item["metadata_column_id"]
+        if column_id in seen_column_ids:
+            raise HTTPException(422, "批次中不能重复包含同一字段")
+        seen_column_ids.add(column_id)
+        status = item.get("mapping_status", "待核验")
+        note = item.get("note", "")
+        if status not in allowed_statuses or not isinstance(note, str) or len(note) > 2000:
+            raise HTTPException(422, "mapping_status 或 note 无效")
+        column = db.get(MetadataColumn, column_id)
+        if not column:
+            raise HTTPException(404, f"元数据字段 {column_id} 不存在")
+        normalized.append((column_id, status, note))
+    results = []
+    for column_id, status, note in normalized:
+        existing = db.scalar(select(DataStandardMapping).where(
+            DataStandardMapping.version_id == version_id,
+            DataStandardMapping.metadata_column_id == column_id,
+        ))
+        if existing:
+            existing.mapping_status = status
+            existing.note = note
+            existing.mapped_at = datetime.utcnow()
+            mapping = existing
+        else:
+            mapping = DataStandardMapping(version_id=version_id, metadata_column_id=column_id,
+                                         mapping_status=status, note=note)
+            db.add(mapping)
+        results.append(mapping)
+    db.commit()
+    for mapping in results:
+        db.refresh(mapping)
+    return {"standard_id": standard_id, "version_id": version_id, "count": len(results),
+            "mappings": [{"id": m.id, "metadata_column_id": m.metadata_column_id,
+                          "mapping_status": m.mapping_status, "note": m.note,
+                          "mapped_at": m.mapped_at} for m in results]}
