@@ -17,10 +17,15 @@ const nav:{id:Page;label:string;icon:any;group:string}[]=[
  {id:'assets',label:'数据资产',icon:Boxes,group:'数据治理'},
  {id:'catalog',label:'元数据目录',icon:FileCheck2,group:'数据治理'},
  {id:'lineage',label:'数据血缘',icon:Workflow,group:'数据治理'},
- {id:'standards',label:'数据标准',icon:ShieldCheck,group:'数据治理'},\n {id:'mapping-review',label:'标准映射审核',icon:CheckCircle2,group:'运营协同'},\n {id:'audit',label:'审计日志',icon:FileText,group:'运营协同'},\n {id:'asset-checklist',label:'资产治理检查',icon:CheckCircle2,group:'运营协同'},\n {id:'report',label:'治理报告',icon:Activity,group:'运营协同'},
+ {id:'standards',label:'数据标准',icon:ShieldCheck,group:'数据治理'},
+ {id:'mapping-review',label:'标准映射审核',icon:CheckCircle2,group:'运营协同'},
+ {id:'audit',label:'审计日志',icon:FileText,group:'运营协同'},
+ {id:'asset-checklist',label:'资产治理检查',icon:CheckCircle2,group:'运营协同'},
+ {id:'report',label:'治理报告',icon:Activity,group:'运营协同'},
  {id:'quality',label:'数据质量',icon:Gauge,group:'数据治理'},
  {id:'tasks',label:'治理任务',icon:ListTodo,group:'运营协同'},
- {id:'analytics',label:'治理运营分析',icon:Activity,group:'运营协同'},\n {id:'task-ops',label:'任务运营看板',icon:Activity,group:'运营协同'},
+ {id:'analytics',label:'治理运营分析',icon:Activity,group:'运营协同'},
+ {id:'task-ops',label:'任务运营看板',icon:Activity,group:'运营协同'},
  {id:'finereport',label:'报表治理',icon:FileText,group:'数据治理'},
  {id:'agent',label:'Agent 助手',icon:Bot,group:'智能应用'}
 ];
