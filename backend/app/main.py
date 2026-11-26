@@ -2849,9 +2849,9 @@ def export_governance_task_review_history(task_id:int,_user:User=Depends(require
 
 # Sprint 225-230: paginated integrity diagnostics and larger bounded CSV export.
 @app.get("/api/v1/governance/review-event-integrity-expanded")
-def governance_review_event_integrity_expanded(limit:int=100,offset:int=0,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+def governance_review_event_integrity_expanded(limit:int=100,offset:int=0,category:str="全部",_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效：limit 为 1-200，offset 必须大于等于 0")
-    events=db.scalars(select(GovernanceReviewEvent).order_by(GovernanceReviewEvent.id.desc())).all()
+    allowed_categories=("全部","orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record")\n    if category not in allowed_categories: raise HTTPException(422,"异常类别筛选值无效")\n    events=db.scalars(select(GovernanceReviewEvent).order_by(GovernanceReviewEvent.id.desc())).all()
     tasks=set(db.scalars(select(GovernanceTask.id)).all())
     records=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
     record_ids={row.id for row in records};record_payloads={};invalid_records=[]
@@ -2872,7 +2872,7 @@ def governance_review_event_integrity_expanded(limit:int=100,offset:int=0,_user:
     issues=[]
     for category,ids in (("orphan_task_event",missing_task),("missing_legacy_link",missing_record),("invalid_event_decision",invalid_decision),("duplicate_task_event",duplicate_task_decisions),("unlinked_legacy_review",unlinked_legacy),("malformed_legacy_record",invalid_records)):
         issues.extend({"category":category,"record_id":rid} for rid in ids)
-    return {"event_count":len(events),"legacy_review_records":len(records),"issue_count":len(issues),"issues":issues[offset:offset+limit],"limit":limit,"offset":offset,"has_more":offset+limit<len(issues),"scope":"Read-only diagnostic; no automatic repair or deletion."}
+    if category!="全部": issues=[issue for issue in issues if issue["category"]==category]\n    total=len(issues)\n    return {"event_count":len(events),"legacy_review_records":len(records),"issue_count":total,"issues":issues[offset:offset+limit],"total":total,"category":category,"limit":limit,"offset":offset,"has_more":offset+limit<total,"scope":"Read-only diagnostic; no automatic repair or deletion. Category filter and offset/limit apply to the generated issue list."}
 
 @app.get("/api/v1/governance/tasks/{task_id}/review-history/export-v2")
 def export_governance_task_review_history_v2(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
