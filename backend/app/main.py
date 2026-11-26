@@ -2672,3 +2672,56 @@ def governance_tasks_operations_overview(_user:User=Depends(require_permission("
         "by_owner":sorted(by_owner.values(),key=lambda x:(-x["overdue"],-x["pending"],x["owner"])),
         "aging_buckets":aging,"monthly_trend":[monthly[k] for k in sorted(monthly)],
         "disclaimer":"Operational aggregation only; closure period uses closed_at when available; not an HR or departmental performance rating."}
+
+
+# Sprint 135-140: remediation evidence and auditable task close-loop
+class GovernanceTaskEvidenceIn(BaseModel):
+    evidence_type: str = Field(default="整改说明", min_length=1, max_length=40)
+    title: str = Field(min_length=2, max_length=180)
+    description: str = Field(default="", max_length=4000)
+    reference_url: str = Field(default="", max_length=1000)
+
+@app.get("/api/v1/governance/tasks/{task_id}/evidence")
+def list_governance_task_evidence(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    rows=db.scalars(select(Record).where(Record.category=="task_evidence").order_by(Record.created_at.desc())).all()
+    items=[]
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("task_id")==task_id:
+            items.append({"id":row.id,"task_id":task_id,"evidence_type":payload.get("evidence_type",""),"title":row.name,"description":payload.get("description",""),"reference_url":payload.get("reference_url",""),"created_by":payload.get("created_by",""),"created_at":row.created_at})
+    return {"task_id":task_id,"items":items,"total":len(items)}
+
+@app.post("/api/v1/governance/tasks/{task_id}/evidence",status_code=201)
+def add_governance_task_evidence(task_id:int,payload:GovernanceTaskEvidenceIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status=="已关闭": raise HTTPException(409,"已关闭任务不可追加整改证据")
+    data={"task_id":task_id,"evidence_type":payload.evidence_type,"description":payload.description,"reference_url":payload.reference_url,"created_by":user.username}
+    row=Record(category="task_evidence",name=payload.title,description=json.dumps(data,ensure_ascii=False),status="已提交",owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:evidence",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/evidence",status_code=201))
+    db.commit();db.refresh(row)
+    return {"id":row.id,"task_id":task_id,"evidence_type":payload.evidence_type,"title":row.name,"description":payload.description,"reference_url":payload.reference_url,"created_by":user.username,"created_at":row.created_at}
+
+@app.get("/api/v1/governance/tasks-closed-loop-report")
+def governance_tasks_closed_loop_report(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    tasks=db.scalars(select(GovernanceTask)).all()
+    evidence_rows=db.scalars(select(Record).where(Record.category=="task_evidence")).all()
+    evidence_by_task={}
+    for row in evidence_rows:
+        try: task_id=json.loads(row.description or "{}").get("task_id")
+        except (TypeError,json.JSONDecodeError): task_id=None
+        if isinstance(task_id,int): evidence_by_task[task_id]=evidence_by_task.get(task_id,0)+1
+    now=datetime.utcnow(); counts={"total":len(tasks),"pending":0,"in_progress":0,"closed":0,"overdue":0,"with_evidence":0,"without_evidence":0}
+    by_source={};by_department={}
+    for t in tasks:
+        counts["pending"]+=int(t.status=="待处理");counts["in_progress"]+=int(t.status=="处理中");counts["closed"]+=int(t.status=="已关闭")
+        counts["overdue"]+=int(t.status!="已关闭" and t.due_date is not None and t.due_date<now)
+        has=evidence_by_task.get(t.id,0)>0;counts["with_evidence"]+=int(has);counts["without_evidence"]+=int(not has)
+        for grouping,key in ((by_source,t.source_type or "unknown"),(by_department,(t.owner_department or "").strip() or "未分配部门")):
+            item=grouping.setdefault(key,{"name":key,"total":0,"closed":0,"overdue":0,"evidence_tasks":0})
+            item["total"]+=1;item["closed"]+=int(t.status=="已关闭");item["overdue"]+=int(t.status!="已关闭" and t.due_date is not None and t.due_date<now);item["evidence_tasks"]+=int(has)
+    counts["closure_rate"]=round(counts["closed"]/counts["total"]*100,2) if counts["total"] else 0
+    return {"generated_at":now,"summary":counts,"by_source":sorted(by_source.values(),key=lambda x:x["name"]),"by_department":sorted(by_department.values(),key=lambda x:x["name"]),"evidence_records":sum(evidence_by_task.values()),"scope":"仅统计工作台治理任务及登记证据；证据登记不代表独立验收或自动复测通过。"}
