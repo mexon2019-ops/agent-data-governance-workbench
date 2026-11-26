@@ -2595,7 +2595,7 @@ def governance_tasks_summary(_user:User=Depends(require_permission("governance:r
     rows=db.scalars(select(GovernanceTask)).all()
     return {"total":len(rows),"pending":sum(t.status=="待处理" for t in rows),
         "in_progress":sum(t.status=="处理中" for t in rows),"closed":sum(t.status=="已关闭" for t in rows),
-        "overdue":sum(t.status!="已关闭" and t.due_date and t.due_date<datetime.utcnow() for t in rows),
+        "overdue":sum(bool(t.status!="已关闭" and t.due_date is not None and t.due_date<datetime.utcnow()) for t in rows),
         "closure_rate":round(sum(t.status=="已关闭" for t in rows)/len(rows)*100,2) if rows else 0}
 
 # Sprint 109–110: department-level task execution metrics.
