@@ -2606,7 +2606,7 @@ def governance_tasks_department_summary(_user:User=Depends(require_permission("g
     return {"departments":sorted(grouped.values(),key=lambda x:(-x["overdue"],-x["pending"],x["department"]))}
 
 
-# Sprint 117-122: task operations overview aggregation (read-only, bounded detail-free output).
+# Sprint 129-134: richer task operations aggregation, including department and owner workload and monthly trend.
 @app.get("/api/v1/governance/tasks-operations-overview")
 def governance_tasks_operations_overview(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     rows=db.scalars(select(GovernanceTask)).all()
@@ -2615,32 +2615,60 @@ def governance_tasks_operations_overview(_user:User=Depends(require_permission("
     by_status={}
     by_priority={}
     by_department={}
+    by_owner={}
     aging={"0-7_days":0,"8-30_days":0,"31-90_days":0,"over_90_days":0}
     unassigned=0
     overdue=0
     closed=0
+    monthly={}
     for task in rows:
-        by_source[task.source_type or "unknown"]=by_source.get(task.source_type or "unknown",0)+1
-        by_status[task.status or "unknown"]=by_status.get(task.status or "unknown",0)+1
+        source=task.source_type or "unknown"
+        status=task.status or "unknown"
         priority=_task_priority(task)
+        dept=(task.owner_department or "").strip() or "未分配部门"
+        owner=(task.owner or "").strip() or "未分配责任人"
+        by_source[source]=by_source.get(source,0)+1
+        by_status[status]=by_status.get(status,0)+1
         by_priority[priority]=by_priority.get(priority,0)+1
-        dept=task.owner_department.strip() or "未分配部门"
-        by_department[dept]=by_department.get(dept,0)+1
-        unassigned+=int(not task.owner.strip())
-        closed+=int(task.status=="已关闭")
-        overdue+=int(task.status!="已关闭" and task.due_date is not None and task.due_date<now)
+        unassigned+=int(owner=="未分配责任人")
+        closed+=int(status=="已关闭")
+        is_overdue=status!="已关闭" and task.due_date is not None and task.due_date<now
+        overdue+=int(is_overdue)
+        dept_item=by_department.setdefault(dept,{"department":dept,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0,"high_priority":0})
+        dept_item["total"]+=1
+        dept_item["pending"]+=int(status in ("待处理","待分派","未开始"))
+        dept_item["in_progress"]+=int(status in ("处理中","进行中"))
+        dept_item["closed"]+=int(status=="已关闭")
+        dept_item["overdue"]+=int(is_overdue)
+        dept_item["high_priority"]+=int(priority=="high")
+        owner_item=by_owner.setdefault(owner,{"owner":owner,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0})
+        owner_item["total"]+=1
+        owner_item["pending"]+=int(status in ("待处理","待分派","未开始"))
+        owner_item["in_progress"]+=int(status in ("处理中","进行中"))
+        owner_item["closed"]+=int(status=="已关闭")
+        owner_item["overdue"]+=int(is_overdue)
         age=max(0,(now-task.created_at).days) if task.created_at else 0
         if age<=7: aging["0-7_days"]+=1
         elif age<=30: aging["8-30_days"]+=1
         elif age<=90: aging["31-90_days"]+=1
         else: aging["over_90_days"]+=1
+        month=task.created_at.strftime("%Y-%m") if task.created_at else "unknown"
+        monthly.setdefault(month,{"month":month,"created":0,"closed":0})["created"]+=1
+        if status=="已关闭":
+            close_month=task.closed_at.strftime("%Y-%m") if task.closed_at else month
+            monthly.setdefault(close_month,{"month":close_month,"created":0,"closed":0})["closed"]+=1
+    for item in by_department.values():
+        item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
+    for item in by_owner.values():
+        item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
     total=len(rows)
-    return {"generated_at":now,"scope":"all governance tasks; counts only",
+    return {"generated_at":now,"scope":"all governance tasks; count-only aggregation",
         "total":total,"closed":closed,"overdue":overdue,"unassigned_owner":unassigned,
         "closure_rate":round(closed/total*100,2) if total else 0,
         "by_source":dict(sorted(by_source.items())),
         "by_status":dict(sorted(by_status.items())),
         "by_priority":dict(sorted(by_priority.items())),
-        "by_department":dict(sorted(by_department.items())),
-        "aging_buckets":aging,
-        "disclaimer":"Operational aggregation only; not an HR or departmental performance rating."}
+        "by_department":sorted(by_department.values(),key=lambda x:(-x["overdue"],-x["pending"],x["department"])),
+        "by_owner":sorted(by_owner.values(),key=lambda x:(-x["overdue"],-x["pending"],x["owner"])),
+        "aging_buckets":aging,"monthly_trend":[monthly[k] for k in sorted(monthly)],
+        "disclaimer":"Operational aggregation only; closure period uses closed_at when available; not an HR or departmental performance rating."}
