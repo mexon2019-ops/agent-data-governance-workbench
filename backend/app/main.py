@@ -2725,3 +2725,56 @@ def governance_tasks_closed_loop_report(_user:User=Depends(require_permission("g
             item["total"]+=1;item["closed"]+=int(t.status=="已关闭");item["overdue"]+=int(t.status!="已关闭" and t.due_date is not None and t.due_date<now);item["evidence_tasks"]+=int(has)
     counts["closure_rate"]=round(counts["closed"]/counts["total"]*100,2) if counts["total"] else 0
     return {"generated_at":now,"summary":counts,"by_source":sorted(by_source.values(),key=lambda x:x["name"]),"by_department":sorted(by_department.values(),key=lambda x:x["name"]),"evidence_records":sum(evidence_by_task.values()),"scope":"仅统计工作台治理任务及登记证据；证据登记不代表独立验收或自动复测通过。"}
+
+# Sprint 141-146: independent remediation review workflow, stored in Record metadata
+class GovernanceTaskReviewIn(BaseModel):
+    decision: str = Field(min_length=2, max_length=20)
+    comment: str = Field(default="", max_length=4000)
+
+@app.get("/api/v1/governance/tasks/{task_id}/reviews")
+def list_governance_task_reviews(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    rows=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.created_at.desc())).all()
+    items=[]
+    for row in rows:
+        try: data=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if data.get("task_id")==task_id: items.append({"id":row.id,"task_id":task_id,"decision":data.get("decision"),"comment":data.get("comment"),"reviewer":data.get("reviewer"),"created_at":row.created_at})
+    return {"items":items,"total":len(items)}
+
+@app.post("/api/v1/governance/tasks/{task_id}/reviews",status_code=201)
+def review_governance_task(task_id:int,payload:GovernanceTaskReviewIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status=="已关闭": raise HTTPException(409,"已关闭任务不接受验收操作")
+    decision=payload.decision.strip()
+    if decision not in ("通过","退回"): raise HTTPException(422,"decision仅允许通过或退回")
+    if task.owner and task.owner.strip()==user.username: raise HTTPException(403,"整改责任人不能自行验收")
+    evidence=db.scalars(select(Record).where(Record.category=="task_evidence")).all()
+    has_evidence=False
+    for row in evidence:
+        try:
+            if json.loads(row.description or "{}").get("task_id")==task_id: has_evidence=True;break
+        except (TypeError,json.JSONDecodeError): pass
+    if decision=="通过" and not has_evidence: raise HTTPException(409,"验收通过前必须登记整改证据")
+    data={"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username}
+    row=Record(category="task_review",name=f"{task.task_code}验收{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"governance_task:{task.task_code}:review",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/reviews",status_code=201))
+    db.commit();db.refresh(row)
+    return {"id":row.id,"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username,"created_at":row.created_at}
+
+@app.get("/api/v1/governance/tasks-acceptance-report")
+def governance_tasks_acceptance_report(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    tasks=db.scalars(select(GovernanceTask)).all()
+    rows=db.scalars(select(Record).where(Record.category=="task_review")).all()
+    reviews={}
+    for row in rows:
+        try: data=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        tid=data.get("task_id")
+        if isinstance(tid,int): reviews.setdefault(tid,[]).append(data.get("decision"))
+    accepted=sum(1 for decisions in reviews.values() if decisions and decisions[-1]=="通过")
+    returned=sum(1 for decisions in reviews.values() if decisions and decisions[-1]=="退回")
+    reviewed=len(reviews); total=len(tasks)
+    return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(rows),"scope":"按任务最近一次记录粗略汇总；当前实现按记录读取顺序推断，尚未引入正式验收状态字段或不可变事件表。"}
