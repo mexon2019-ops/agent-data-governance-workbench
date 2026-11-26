@@ -10,7 +10,8 @@ from app import main
 def test_acceptance_report_latest_valid_decision_and_scope():
     main.Base.metadata.create_all(main.engine)
     with main.SessionLocal() as db:
-        task = main.GovernanceTask(task_code="S206-REPORT", title="Report regression", status="处理中")
+        baseline = main.governance_tasks_acceptance_report(_user=None, db=db)
+        task = main.GovernanceTask(task_code="S206-REPORT-"+uuid.uuid4().hex[:8], title="Report regression", status="处理中")
         db.add(task)
         db.commit()
         db.refresh(task)
@@ -24,15 +25,15 @@ def test_acceptance_report_latest_valid_decision_and_scope():
         db.add_all(rows)
         db.commit()
         report = main.governance_tasks_acceptance_report(_user=None, db=db)
-        assert report["returned_tasks"] == 1
-        assert report["accepted_tasks"] == 0
-        assert report["reviewed_tasks"] == 1
-        assert report["unreviewed_tasks"] == max(0, report["total_tasks"] - 1)
-        assert report["review_records"] >= 4
+        assert report["returned_tasks"] == baseline["returned_tasks"] + 1
+        assert report["accepted_tasks"] == baseline["accepted_tasks"]
+        assert report["reviewed_tasks"] == baseline["reviewed_tasks"] + 1
+        assert report["total_tasks"] == baseline["total_tasks"] + 1
+        assert report["review_records"] >= baseline["review_records"] + 4
         # Clean only rows and task created by this fixture.
         for row in db.query(main.Record).filter(main.Record.category == "task_review").all():
             try:
-                if json.loads(row.description or "{}").get("task_id") == task_id or row.name in ("malformed", "unknown"):
+                if json.loads(row.description or "{}").get("task_id") == task_id or row.name in ("malformed", "unknown") and row.description in ("{not-json", json.dumps({"task_id": task_id, "decision": "未知"})):
                     db.delete(row)
             except (TypeError, json.JSONDecodeError):
                 if row.name == "malformed":
