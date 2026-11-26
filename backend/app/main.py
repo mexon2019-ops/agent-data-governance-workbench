@@ -2413,6 +2413,18 @@ class GovernanceTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+
+class GovernanceReviewEvent(Base):
+    __tablename__ = "governance_review_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("governance_tasks.id", ondelete="CASCADE"), index=True)
+    reviewer: Mapped[str] = mapped_column(String(120), default="", index=True)
+    decision: Mapped[str] = mapped_column(String(20))
+    comment: Mapped[str] = mapped_column(Text, default="")
+    legacy_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class GovernanceTaskCreate(BaseModel):
     title: str = Field(min_length=2, max_length=240)
     task_type: str = Field(default="整改", max_length=40)
@@ -2760,24 +2772,28 @@ def review_governance_task(task_id:int,payload:GovernanceTaskReviewIn,user:User=
     if decision=="通过" and not has_evidence: raise HTTPException(409,"验收通过前必须登记整改证据")
     data={"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username}
     row=Record(category="task_review",name=f"{task.task_code}验收{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
-    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"governance_task:{task.task_code}:review",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/reviews",status_code=201))
+    db.add(row);db.flush()\n    db.add(GovernanceReviewEvent(task_id=task_id,reviewer=user.username,decision=decision,comment=payload.comment,legacy_record_id=row.id))\n    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"governance_task:{task.task_code}:review",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/reviews",status_code=201))
     db.commit();db.refresh(row)
     return {"id":row.id,"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username,"created_at":row.created_at}
 
 @app.get("/api/v1/governance/tasks-acceptance-report")
 def governance_tasks_acceptance_report(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     tasks=db.scalars(select(GovernanceTask)).all()
-    rows=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    event_rows=db.scalars(select(GovernanceReviewEvent).order_by(GovernanceReviewEvent.id.desc())).all()
     reviews={}
-    for row in rows:
+    for event in event_rows:
+        if event.task_id not in reviews and event.decision in ("通过","退回"): reviews[event.task_id]=event.decision
+    # Legacy fallback only for tasks not yet represented in the event table.
+    legacy_rows=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    legacy_reviews={}
+    for row in legacy_rows:
         try: data=json.loads(row.description or "{}")
         except (TypeError,json.JSONDecodeError): continue
-        tid=data.get("task_id")
-        # Descending record IDs make the first valid event the latest for each task.
-        if isinstance(tid,int) and tid not in reviews:
-            decision=data.get("decision")
-            if decision in ("通过","退回"): reviews[tid]=decision
+        tid=data.get("task_id"); decision=data.get("decision")
+        if isinstance(tid,int) and tid not in legacy_reviews and decision in ("通过","退回"): legacy_reviews[tid]=decision
+    for tid,decision in legacy_reviews.items():
+        if tid not in reviews: reviews[tid]=decision
     accepted=sum(1 for decision in reviews.values() if decision=="通过")
     returned=sum(1 for decision in reviews.values() if decision=="退回")
     reviewed=len(reviews); total=len(tasks)
-    return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(rows),"scope":"按记录ID降序取每个任务最新有效验收决定；尚未引入正式验收状态字段或不可变事件表。"}
+    return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(event_rows)+len(legacy_rows),"scope":"优先读取专用验收事件；无专用事件任务回退读取旧Record记录。"}
