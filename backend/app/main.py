@@ -2517,6 +2517,24 @@ def close_governance_task(task_id:int,payload:GovernanceTaskAction,
     db.commit();db.refresh(task)
     return _task_public(task)
 
+# Sprint 99: checklist-driven task generation with source-level deduplication.
+@app.post("/api/v1/governance/tasks/generate-from-checklist")
+def generate_tasks_from_asset_checklist(user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    checklist=asset_review_checklist(_user=user,db=db)["items"]
+    check_titles={"business_definition":"补充资产业务定义","owner":"明确资产责任人","department":"明确资产责任部门","domain":"补充业务域","classification":"完成敏感级别分级","standard_mapping":"补充数据标准映射","quality_coverage":"建立数据质量规则"}
+    created=[]; skipped=0
+    for item in checklist:
+        for check_key,passed in item["checks"].items():
+            if passed: continue
+            source_key=f'{item["asset_id"]}:{check_key}'
+            existing=db.scalar(select(GovernanceTask.id).where(GovernanceTask.source_type=="asset_checklist",GovernanceTask.source_id==source_key))
+            if existing: skipped+=1; continue
+            task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=f'{check_titles.get(check_key,"完善治理项")}：{item["name"]}',task_type="资产治理",source_type="asset_checklist",source_id=source_key,description=f'资产 {item["asset_code"]} / {item["name"]} 未通过治理检查项：{check_key}',action_plan=check_titles.get(check_key,"完成治理检查项"),created_by=user.username)
+            db.add(task);db.flush();created.append(task)
+            db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:auto_asset_check",http_method="POST",path="/api/v1/governance/tasks/generate-from-checklist",status_code=201))
+    db.commit()
+    return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅依据登记的资产治理元数据检查项生成任务；未读取业务数据。"}
+
 @app.get("/api/v1/governance/tasks-summary")
 def governance_tasks_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     rows=db.scalars(select(GovernanceTask)).all()
