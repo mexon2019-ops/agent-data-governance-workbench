@@ -2552,6 +2552,22 @@ def generate_tasks_from_mapping_review(user:User=Depends(require_permission("gov
     db.commit()
     return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅基于标准映射状态生成治理任务，不读取业务数据。"}
 
+# Sprint 101: create remediation tasks from recorded failed quality runs.
+@app.post("/api/v1/governance/tasks/generate-from-quality-runs")
+def generate_tasks_from_quality_runs(user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    runs=db.scalars(select(QualityRun).where(QualityRun.failed_count>0).order_by(QualityRun.id.desc()).limit(500)).all()
+    created=[];skipped=0
+    for run in runs:
+        source_key=str(run.id)
+        existing=db.scalar(select(GovernanceTask.id).where(GovernanceTask.source_type=="quality_run",GovernanceTask.source_id==source_key))
+        if existing:skipped+=1;continue
+        rule=db.get(QualityRule,run.rule_id)
+        task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=f'数据质量整改：{rule.name if rule else "规则"}',task_type="数据质量",source_type="quality_run",source_id=source_key,description=f'质量检测记录 {run.id} 有 {run.failed_count} 条异常（检测总数 {run.total_count}，通过率 {run.pass_rate}%）。请分析并整改。',action_plan="核查异常原因，修复或解释数据问题并再次执行质量检测",created_by=user.username)
+        db.add(task);db.flush();created.append(task)
+        db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:auto_quality",http_method="POST",path="/api/v1/governance/tasks/generate-from-quality-runs",status_code=201))
+    db.commit()
+    return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅基于已记录的数据质量检测结果生成任务，不执行额外数据扫描。"}
+
 @app.get("/api/v1/governance/tasks-summary")
 def governance_tasks_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     rows=db.scalars(select(GovernanceTask)).all()
