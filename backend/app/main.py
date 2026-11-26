@@ -2774,7 +2774,7 @@ def governance_tasks_acceptance_report(_user:User=Depends(require_permission("go
         except (TypeError,json.JSONDecodeError): continue
         tid=data.get("task_id")
         if isinstance(tid,int): reviews.setdefault(tid,[]).append(data.get("decision"))
-    accepted=sum(1 for decisions in reviews.values() if decisions and decisions[-1]=="通过")
-    returned=sum(1 for decisions in reviews.values() if decisions and decisions[-1]=="退回")
+    accepted=sum(1 for decisions in reviews.values() if decisions and decisions[0]=="通过")
+    returned=sum(1 for decisions in reviews.values() if decisions and decisions[0]=="退回")
     reviewed=len(reviews); total=len(tasks)
     return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(rows),"scope":"按任务最近一次记录粗略汇总；当前实现按记录读取顺序推断，尚未引入正式验收状态字段或不可变事件表。"}
