@@ -2640,7 +2640,7 @@ def governance_tasks_operations_overview(_user:User=Depends(require_permission("
         dept_item["in_progress"]+=int(status in ("处理中","进行中"))
         dept_item["closed"]+=int(status=="已关闭")
         dept_item["overdue"]+=int(is_overdue)
-        dept_item["high_priority"]+=int(priority=="high")
+        dept_item["high_priority"]+=int(priority=="高")
         owner_item=by_owner.setdefault(owner,{"owner":owner,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0})
         owner_item["total"]+=1
         owner_item["pending"]+=int(status in ("待处理","待分派","未开始"))
