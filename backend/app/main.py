@@ -2960,6 +2960,18 @@ def review_integrity_detail(category:str,record_id:int,_user:User=Depends(requir
             detail.update({"resolved":True,"legacy_record":{"id":row.id,"name":row.name,"status":row.status,"owner":row.owner,"created_at":row.created_at},"payload":payload})
     return detail
 
+@app.get("/api/v1/governance/review-integrity-action-history")
+def review_integrity_action_history(category:str,record_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or record_id<1: raise HTTPException(422,"异常定位参数无效")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("issue_category")==category and payload.get("issue_record_id")==record_id:
+            history=payload.get("history",[])
+            return {"action_id":row.id,"category":category,"record_id":record_id,"history":history[-100:]}
+    return {"action_id":None,"category":category,"record_id":record_id,"history":[]}
+
 @app.get("/api/v1/governance/review-integrity-action-summary")
 def review_integrity_action_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
