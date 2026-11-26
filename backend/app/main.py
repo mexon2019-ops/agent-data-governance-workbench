@@ -2535,6 +2535,23 @@ def generate_tasks_from_asset_checklist(user:User=Depends(require_permission("go
     db.commit()
     return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅依据登记的资产治理元数据检查项生成任务；未读取业务数据。"}
 
+# Sprint 100: standard mapping follow-up task generation.
+@app.post("/api/v1/governance/tasks/generate-from-mappings")
+def generate_tasks_from_mapping_review(user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(DataStandardMapping).where(DataStandardMapping.mapping_status.in_(["待核验","不符合"]))).all()
+    created=[];skipped=0
+    for mapping in rows:
+        source_key=str(mapping.id)
+        existing=db.scalar(select(GovernanceTask.id).where(GovernanceTask.source_type=="standard_mapping",GovernanceTask.source_id==source_key))
+        if existing: skipped+=1;continue
+        column=db.get(MetadataColumn,mapping.metadata_column_id)
+        title=f'核验标准映射：{column.column_name if column else "字段"}'
+        task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=title,task_type="标准映射",source_type="standard_mapping",source_id=source_key,description=f'映射记录 {mapping.id} 状态为 {mapping.mapping_status}，请完成核验或修正。',action_plan="核验字段业务含义、标准匹配和映射状态",created_by=user.username)
+        db.add(task);db.flush();created.append(task)
+        db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:auto_mapping_review",http_method="POST",path="/api/v1/governance/tasks/generate-from-mappings",status_code=201))
+    db.commit()
+    return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅基于标准映射状态生成治理任务，不读取业务数据。"}
+
 @app.get("/api/v1/governance/tasks-summary")
 def governance_tasks_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     rows=db.scalars(select(GovernanceTask)).all()
