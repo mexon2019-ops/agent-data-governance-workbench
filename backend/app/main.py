@@ -2767,14 +2767,17 @@ def review_governance_task(task_id:int,payload:GovernanceTaskReviewIn,user:User=
 @app.get("/api/v1/governance/tasks-acceptance-report")
 def governance_tasks_acceptance_report(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
     tasks=db.scalars(select(GovernanceTask)).all()
-    rows=db.scalars(select(Record).where(Record.category=="task_review")).all()
+    rows=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
     reviews={}
     for row in rows:
         try: data=json.loads(row.description or "{}")
         except (TypeError,json.JSONDecodeError): continue
         tid=data.get("task_id")
-        if isinstance(tid,int): reviews.setdefault(tid,[]).append(data.get("decision"))
-    accepted=sum(1 for decisions in reviews.values() if decisions and decisions[0]=="通过")
-    returned=sum(1 for decisions in reviews.values() if decisions and decisions[0]=="退回")
+        # Descending record IDs make the first valid event the latest for each task.
+        if isinstance(tid,int) and tid not in reviews:
+            decision=data.get("decision")
+            if decision in ("通过","退回"): reviews[tid]=decision
+    accepted=sum(1 for decision in reviews.values() if decision=="通过")
+    returned=sum(1 for decision in reviews.values() if decision=="退回")
     reviewed=len(reviews); total=len(tasks)
-    return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(rows),"scope":"按任务最近一次记录粗略汇总；当前实现按记录读取顺序推断，尚未引入正式验收状态字段或不可变事件表。"}
+    return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(rows),"scope":"按记录ID降序取每个任务最新有效验收决定；尚未引入正式验收状态字段或不可变事件表。"}
