@@ -11,7 +11,7 @@ from uuid import uuid4
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -2802,7 +2802,8 @@ def governance_tasks_acceptance_report(_user:User=Depends(require_permission("go
 
 # Sprint 219-224: audit timeline and event-link consistency checks.
 @app.get("/api/v1/governance/tasks/{task_id}/review-history")
-def governance_task_review_history(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+def governance_task_review_history(task_id:int,limit:int=100,offset:int=0,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效：limit 为 1-200，offset 必须大于等于 0")
     task=db.get(GovernanceTask,task_id)
     if task is None: raise HTTPException(404,"治理任务不存在")
     events=db.scalars(select(GovernanceReviewEvent).where(GovernanceReviewEvent.task_id==task_id).order_by(GovernanceReviewEvent.id.desc())).all()
@@ -2816,7 +2817,8 @@ def governance_task_review_history(task_id:int,_user:User=Depends(require_permis
         if payload.get("task_id")==task_id and payload.get("decision") in ("通过","退回"):
             items.append({"event_id":None,"legacy_record_id":row.id,"decision":payload.get("decision"),"reviewer":payload.get("reviewer") or row.owner,"comment":payload.get("comment") or "","created_at":row.created_at,"source":"legacy"})
     items.sort(key=lambda item:(item["created_at"] or datetime.min,item["legacy_record_id"] or 0),reverse=True)
-    return {"task_id":task_id,"task_code":task.task_code,"history":items,"count":len(items)}
+    total=len(items)
+    return {"task_id":task_id,"task_code":task.task_code,"history":items[offset:offset+limit],"count":total,"limit":limit,"offset":offset,"has_more":offset+limit<total}
 
 @app.get("/api/v1/governance/review-event-integrity")
 def governance_review_event_integrity(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
@@ -2829,3 +2831,17 @@ def governance_review_event_integrity(_user:User=Depends(require_permission("gov
         if event.legacy_record_id is not None and event.legacy_record_id not in record_ids: missing_legacy.append(event.id)
         if event.decision not in ("通过","退回"): invalid.append(event.id)
     return {"event_count":len(events),"orphan_task_event_ids":missing_task,"missing_legacy_record_event_ids":missing_legacy,"invalid_decision_event_ids":invalid,"integrity_ok":not(missing_task or missing_legacy or invalid)}
+
+
+@app.get("/api/v1/governance/tasks/{task_id}/review-history/export")
+def export_governance_task_review_history(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    history=governance_task_review_history(task_id,limit=200,offset=0,_user=_user,db=db)
+    if history["count"]>200: raise HTTPException(422,"记录超过200条，请分页查询后分别导出")
+    import csv,io
+    output=io.StringIO(newline="")
+    writer=csv.writer(output)
+    writer.writerow(["task_id","task_code","event_id","legacy_record_id","decision","reviewer","comment","created_at","source"])
+    for item in history["history"]:
+        writer.writerow([task_id,history["task_code"],item["event_id"],item["legacy_record_id"],item["decision"],item["reviewer"],item["comment"],item["created_at"],item["source"]])
+    csv_content="\\ufeff"+output.getvalue()
+    return Response(content=csv_content,media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=task-{task_id}-review-history.csv"})
