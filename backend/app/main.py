@@ -2984,3 +2984,38 @@ def review_integrity_action_summary(_user:User=Depends(require_permission("gover
         cat=payload.get("issue_category","未知")
         by_category[cat]=by_category.get(cat,0)+1
     return {"summary":counts,"by_category":by_category,"scope":"仅统计已登记的异常处理记录；不自动修复验收事件或历史数据。"}
+
+# Sprint 265: independent review records for resolved anomaly actions.
+class IntegrityActionReviewIn(BaseModel):
+    issue_category: str = Field(min_length=2, max_length=80)
+    issue_record_id: int = Field(ge=1)
+    decision: str = Field(min_length=2, max_length=20)
+    comment: str = Field(default="", max_length=4000)
+
+@app.get("/api/v1/governance/review-integrity-action-reviews")
+def list_integrity_action_reviews(category:str,record_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or record_id<1: raise HTTPException(422,"异常定位参数无效")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action_review").order_by(Record.id.desc())).all(); items=[]
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("issue_category")==category and payload.get("issue_record_id")==record_id: items.append({"id":row.id,**payload,"created_at":row.created_at})
+    return {"items":items,"total":len(items)}
+
+@app.post("/api/v1/governance/review-integrity-action-reviews",status_code=201)
+def create_integrity_action_review(payload:IntegrityActionReviewIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    category=payload.issue_category.strip(); decision=payload.decision.strip()
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or payload.issue_record_id<1: raise HTTPException(422,"异常定位参数无效")
+    if decision not in ("通过","退回"): raise HTTPException(422,"复核决策仅允许通过或退回")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all(); target=None
+    for row in rows:
+        try: data=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if data.get("issue_category")==category and data.get("issue_record_id")==payload.issue_record_id: target=row;break
+    if target is None: raise HTTPException(404,"尚未登记该异常的处置记录")
+    if target.status!="已解决": raise HTTPException(409,"异常处置状态为已解决后才可独立复核")
+    if target.owner and target.owner.strip()==user.username: raise HTTPException(403,"处置登记人不能自行复核")
+    data={"issue_category":category,"issue_record_id":payload.issue_record_id,"decision":decision,"comment":payload.comment.strip(),"reviewer":user.username}
+    row=Record(category="review_integrity_action_review",name=f"异常复核{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"review_integrity_action:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-action-reviews",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,**data,"created_at":row.created_at}
