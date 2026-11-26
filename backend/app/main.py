@@ -2930,15 +2930,35 @@ def create_review_integrity_action(payload:ReviewIntegrityActionIn,user:User=Dep
         try: existing=json.loads(row.description or "{}")
         except (TypeError,json.JSONDecodeError): continue
         if existing.get("issue_category")==category and existing.get("issue_record_id")==payload.issue_record_id:
-            existing["note"]=note
+            history=existing.get("history",[])\n            history.append({"status":status,"note":note,"actor":user.username,"changed_at":datetime.utcnow().isoformat(),"previous_status":row.status})\n            existing["history"]=history[-100:]\n            existing["note"]=note
             row.description=json.dumps(existing,ensure_ascii=False)
             row.status=status;row.owner=user.username
             db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=200))
             db.commit();db.refresh(row)
             return {"id":row.id,**key,"status":row.status,"note":note,"owner":row.owner,"created_at":row.created_at}
-    row=Record(category="review_integrity_action",name=f"{category}:{payload.issue_record_id}",description=json.dumps({**key,"note":note},ensure_ascii=False),status=status,owner=user.username)
+    row=Record(category="review_integrity_action",name=f"{category}:{payload.issue_record_id}",description=json.dumps({**key,"note":note,"history":[{"status":status,"note":note,"actor":user.username,"changed_at":datetime.utcnow().isoformat(),"previous_status":None}]},ensure_ascii=False),status=status,owner=user.username)
     db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=201));db.commit();db.refresh(row)
     return {"id":row.id,**key,"status":row.status,"note":note,"owner":row.owner,"created_at":row.created_at}
+
+# Sprint 243-248: resolve diagnostic references without mutating historical records.
+@app.get("/api/v1/governance/review-event-integrity-detail")
+def review_integrity_detail(category:str,record_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    allowed=("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record")
+    if category not in allowed or record_id<1: raise HTTPException(422,"异常定位参数无效")
+    detail={"category":category,"record_id":record_id,"resolved":False,"references":[]}
+    if category in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event"):
+        event=db.get(GovernanceReviewEvent,record_id)
+        if event:
+            task=db.get(GovernanceTask,event.task_id)
+            legacy=db.get(Record,event.legacy_record_id) if event.legacy_record_id else None
+            detail.update({"resolved":True,"event":{"id":event.id,"task_id":event.task_id,"decision":event.decision,"reviewer":event.reviewer,"comment":event.comment,"created_at":event.created_at},"task":({"id":task.id,"task_code":task.task_code,"title":task.title,"status":task.status,"owner":task.owner} if task else None),"legacy_record":({"id":legacy.id,"name":legacy.name,"status":legacy.status,"created_at":legacy.created_at} if legacy else None)})
+    else:
+        row=db.get(Record,record_id)
+        if row and row.category=="task_review":
+            try: payload=json.loads(row.description or "{}")
+            except (TypeError,json.JSONDecodeError): payload={}
+            detail.update({"resolved":True,"legacy_record":{"id":row.id,"name":row.name,"status":row.status,"owner":row.owner,"created_at":row.created_at},"payload":payload})
+    return detail
 
 @app.get("/api/v1/governance/review-integrity-action-summary")
 def review_integrity_action_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
