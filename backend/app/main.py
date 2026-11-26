@@ -2211,6 +2211,44 @@ def governance_trends(_user: User = Depends(require_permission("governance:read"
     return {"months": buckets, "basis": "按治理问题创建时间及关闭时间统计；不回溯历史状态，仅使用治理问题记录。"}
 
 
+
+# Sprint 53: standards mapping review queue
+@app.get("/api/v1/standards/mappings/review-queue")
+def standards_mapping_review_queue(
+    status: str = "待核验",
+    standard_id: int | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    _user: User = Depends(require_permission("governance:read")),
+    db: Session = Depends(db_session),
+):
+    allowed_statuses = {"待核验", "已落标", "不符合", "全部"}
+    if status not in allowed_statuses:
+        raise HTTPException(422, "状态筛选无效")
+    if limit < 1 or limit > 200 or offset < 0:
+        raise HTTPException(422, "分页参数无效：limit 为 1-200，offset 必须大于等于 0")
+    query = select(DataStandardMapping, DataStandardVersion, DataStandard, MetadataColumn, MetadataTable, DataSource).join(
+        DataStandardVersion, DataStandardMapping.version_id == DataStandardVersion.id
+    ).join(DataStandard, DataStandardVersion.standard_id == DataStandard.id
+    ).join(MetadataColumn, DataStandardMapping.metadata_column_id == MetadataColumn.id
+    ).join(MetadataTable, MetadataColumn.table_id == MetadataTable.id
+    ).join(DataSource, MetadataTable.source_id == DataSource.id)
+    if status != "全部":
+        query = query.where(DataStandardMapping.mapping_status == status)
+    if standard_id is not None:
+        query = query.where(DataStandard.id == standard_id)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.execute(query.order_by(DataStandardMapping.mapped_at.desc(), DataStandardMapping.id.desc()).offset(offset).limit(limit)).all()
+    return {"total": total, "limit": limit, "offset": offset, "items": [
+        {"mapping_id": mapping.id, "mapping_status": mapping.mapping_status, "note": mapping.note,
+         "mapped_at": mapping.mapped_at, "standard_id": standard.id, "standard_code": standard.standard_code,
+         "standard_name": standard.name, "version_number": version.version_number,
+         "column_id": column.id, "column_name": column.column_name, "data_type": column.data_type,
+         "table_id": table.id, "schema_name": table.schema_name, "table_name": table.table_name,
+         "source_name": source.name}
+        for mapping, version, standard, column, table, source in rows]}
+
+
 # Sprint 52: bulk standard-field mapping endpoint.
 @app.post("/api/v1/standards/{standard_id}/versions/{version_id}/mappings/bulk", status_code=201)
 def bulk_create_standard_mappings(
