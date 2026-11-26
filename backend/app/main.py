@@ -2391,3 +2391,136 @@ def governance_review_report(_user: User = Depends(require_permission("governanc
         "checklist_complete": total_assets-len(incomplete), "checklist_incomplete": len(incomplete),
         "pending_mappings": pending, "noncompliant_mappings": noncompliant,
         "incomplete_assets": incomplete, "basis": "仅汇总治理元数据和流程记录；未完成的证据明确标示，报告不构成合规认定。"}
+
+# Sprint 87-92: Governance task center and lifecycle
+class GovernanceTask(Base):
+    __tablename__ = "governance_tasks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(240))
+    task_type: Mapped[str] = mapped_column(String(40), default="整改")
+    source_type: Mapped[str] = mapped_column(String(40), default="manual")
+    source_id: Mapped[str] = mapped_column(String(100), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    action_plan: Mapped[str] = mapped_column(Text, default="")
+    owner: Mapped[str] = mapped_column(String(120), default="")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    created_by: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(30), default="待处理", index=True)
+    due_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    close_note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+class GovernanceTaskCreate(BaseModel):
+    title: str = Field(min_length=2, max_length=240)
+    task_type: str = Field(default="整改", max_length=40)
+    source_type: str = Field(default="manual", max_length=40)
+    source_id: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=4000)
+    action_plan: str = Field(default="", max_length=4000)
+    owner: str = Field(default="", max_length=120)
+    owner_department: str = Field(default="", max_length=120)
+    due_date: datetime | None = None
+
+class GovernanceTaskUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=2, max_length=240)
+    description: str | None = Field(default=None, max_length=4000)
+    action_plan: str | None = Field(default=None, max_length=4000)
+    owner: str | None = Field(default=None, max_length=120)
+    owner_department: str | None = Field(default=None, max_length=120)
+    due_date: datetime | None = None
+
+class GovernanceTaskAction(BaseModel):
+    note: str = Field(default="", max_length=4000)
+
+def _task_public(task: GovernanceTask):
+    return {"id":task.id,"task_code":task.task_code,"title":task.title,"task_type":task.task_type,
+        "source_type":task.source_type,"source_id":task.source_id,"description":task.description,
+        "action_plan":task.action_plan,"owner":task.owner,"owner_department":task.owner_department,
+        "created_by":task.created_by,"status":task.status,"due_date":task.due_date,
+        "close_note":task.close_note,"created_at":task.created_at,"updated_at":task.updated_at,
+        "closed_at":task.closed_at}
+
+@app.post("/api/v1/governance/tasks", status_code=201)
+def create_governance_task(payload: GovernanceTaskCreate,
+    user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
+    task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=payload.title,
+        task_type=payload.task_type,source_type=payload.source_type,source_id=payload.source_id,
+        description=payload.description,action_plan=payload.action_plan,owner=payload.owner,
+        owner_department=payload.owner_department,created_by=user.username,due_date=payload.due_date)
+    db.add(task);db.flush()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",
+        resource=f"governance_task:{task.task_code}",http_method="POST",
+        path="/api/v1/governance/tasks",status_code=201))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.get("/api/v1/governance/tasks")
+def list_governance_tasks(status: str | None = None, task_type: str | None = None,
+    owner_department: str | None = None, limit: int = 100, offset: int = 0,
+    _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效")
+    query=select(GovernanceTask)
+    if status: query=query.where(GovernanceTask.status==status)
+    if task_type: query=query.where(GovernanceTask.task_type==task_type)
+    if owner_department: query=query.where(GovernanceTask.owner_department.contains(owner_department))
+    total=db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    tasks=db.scalars(query.order_by(GovernanceTask.updated_at.desc(),GovernanceTask.id.desc()).offset(offset).limit(limit)).all()
+    return {"total":total,"limit":limit,"offset":offset,"items":[_task_public(t) for t in tasks]}
+
+@app.get("/api/v1/governance/tasks/{task_id}")
+def get_governance_task(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    return _task_public(task)
+
+@app.patch("/api/v1/governance/tasks/{task_id}")
+def update_governance_task(task_id:int,payload:GovernanceTaskUpdate,
+    user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status=="已关闭": raise HTTPException(409,"已关闭任务不可编辑")
+    for field,value in payload.model_dump(exclude_unset=True).items(): setattr(task,field,value)
+    task.updated_at=datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",
+        resource=f"governance_task:{task.task_code}",http_method="PATCH",
+        path=f"/api/v1/governance/tasks/{task_id}",status_code=200))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.post("/api/v1/governance/tasks/{task_id}/start")
+def start_governance_task(task_id:int,payload:GovernanceTaskAction,
+    user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status!="待处理": raise HTTPException(409,"仅待处理任务可启动")
+    task.status="处理中";task.updated_at=datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",
+        resource=f"governance_task:{task.task_code}:开始处理",http_method="POST",
+        path=f"/api/v1/governance/tasks/{task_id}/start",status_code=200))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.post("/api/v1/governance/tasks/{task_id}/close")
+def close_governance_task(task_id:int,payload:GovernanceTaskAction,
+    user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    if len(payload.note.strip())<3: raise HTTPException(422,"关闭任务需填写整改结果或复核说明")
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status!="处理中": raise HTTPException(409,"仅处理中任务可关闭")
+    task.status="已关闭";task.close_note=payload.note.strip();task.closed_at=datetime.utcnow();task.updated_at=datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",
+        resource=f"governance_task:{task.task_code}:关闭",http_method="POST",
+        path=f"/api/v1/governance/tasks/{task_id}/close",status_code=200))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.get("/api/v1/governance/tasks-summary")
+def governance_tasks_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceTask)).all()
+    return {"total":len(rows),"pending":sum(t.status=="待处理" for t in rows),
+        "in_progress":sum(t.status=="处理中" for t in rows),"closed":sum(t.status=="已关闭" for t in rows),
+        "overdue":sum(t.status!="已关闭" and t.due_date and t.due_date<datetime.utcnow() for t in rows),
+        "closure_rate":round(sum(t.status=="已关闭" for t in rows)/len(rows)*100,2) if rows else 0}
