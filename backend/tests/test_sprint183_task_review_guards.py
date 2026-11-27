@@ -26,6 +26,10 @@ def cleanup(db, task):
 
 def test_task_review_requires_evidence_and_independent_reviewer():
     main.Base.metadata.create_all(main.engine)
+    # Prevent SQLite primary-key reuse from colliding with historical event links.
+    with main.SessionLocal() as db:
+        db.execute(main.delete(main.GovernanceReviewEvent).where(main.GovernanceReviewEvent.legacy_record_id.is_not(None)))
+        db.commit()
     with main.SessionLocal() as db:
         task=main.GovernanceTask(task_code="S183-REVIEW-"+uuid.uuid4().hex[:8],title="Review flow",status="处理中",owner="worker")
         db.add(task);db.commit();db.refresh(task)
