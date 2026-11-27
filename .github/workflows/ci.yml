@@ -39,6 +39,7 @@ jobs:
         run: |
           cd frontend
           npm install
+          npm run build
           npm install --no-save playwright
           npx playwright install --with-deps chromium
       - name: Start frontend
