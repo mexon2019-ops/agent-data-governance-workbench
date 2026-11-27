@@ -2947,7 +2947,10 @@ def create_review_integrity_action(payload:ReviewIntegrityActionIn,user:User=Dep
         try: existing=json.loads(row.description or "{}")
         except (TypeError,json.JSONDecodeError): continue
         if existing.get("issue_category")==category and existing.get("issue_record_id")==payload.issue_record_id:
-            history=existing.get("history",[])\n            history.append({"status":status,"note":note,"actor":user.username,"changed_at":datetime.utcnow().isoformat(),"previous_status":row.status})\n            existing["history"]=history[-100:]\n            existing["note"]=note
+            history=existing.get("history",[])
+            history.append({"status":status,"note":note,"actor":user.username,"changed_at":datetime.utcnow().isoformat(),"previous_status":row.status})
+            existing["history"]=history[-100:]
+            existing["note"]=note
             row.description=json.dumps(existing,ensure_ascii=False)
             row.status=status;row.owner=user.username
             db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=200))
