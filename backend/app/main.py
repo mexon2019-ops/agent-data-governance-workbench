@@ -2888,7 +2888,8 @@ def governance_review_event_integrity_expanded(limit:int=100,offset:int=0,catego
     if status!="全部":
         if status not in status_counts: raise HTTPException(422,"异常处置状态筛选值无效")
         issues=[issue for issue in issues if action_status.get((issue["category"],issue["record_id"]),"未登记")==status]
-    total=len(issues)\n    return {"event_count":len(events),"legacy_review_records":len(records),"issue_count":total,"issues":issues[offset:offset+limit],"total":total,"category":category,"status":status,"status_counts":status_counts,"limit":limit,"offset":offset,"has_more":offset+limit<total,"scope":"Read-only diagnostic; server-side category/status filtering and offset/limit apply after diagnostic generation. No automatic repair."}
+    total=len(issues)
+    return {"event_count":len(events),"legacy_review_records":len(records),"issue_count":total,"issues":issues[offset:offset+limit],"total":total,"category":category,"status":status,"status_counts":status_counts,"limit":limit,"offset":offset,"has_more":offset+limit<total,"scope":"Read-only diagnostic; server-side category/status filtering and offset/limit apply after diagnostic generation. No automatic repair."}
 
 @app.get("/api/v1/governance/tasks/{task_id}/review-history/export-v2")
 def export_governance_task_review_history_v2(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
