@@ -33,7 +33,7 @@ def test_expanded_integrity_report_and_export_v2():
         db.add(task);db.commit();db.refresh(task)
         legacy=main.Record(category="task_review",name="fixture",description=json.dumps({"task_id":task.id,"decision":"通过","reviewer":"reviewer","comment":"comma, quote \\\""}))
         db.add(legacy);db.flush()
-        event=main.GovernanceReviewEvent(task_id=task.id,decision="通过",reviewer="reviewer",comment="fixture",legacy_record_id=legacy.id)
+        event=main.GovernanceReviewEvent(task_id=task.id,decision="通过",reviewer="reviewer",comment="comma, quote \\"",legacy_record_id=legacy.id)
         db.add(event);db.commit()
         report=main.governance_review_event_integrity_expanded(limit=10,offset=0,_user=None,db=db)
         assert report["event_count"]>=1 and report["issues"] is not None
