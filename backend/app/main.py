@@ -11,7 +11,7 @@ from uuid import uuid4
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -2209,3 +2209,1105 @@ def governance_trends(_user: User = Depends(require_permission("governance:read"
         closed = db.scalar(select(func.count(GovernanceIssue.id)).where(GovernanceIssue.closed_at >= start, GovernanceIssue.closed_at < end)) or 0
         buckets.append({"month": start.strftime("%Y-%m"), "created": created, "closed": closed})
     return {"months": buckets, "basis": "按治理问题创建时间及关闭时间统计；不回溯历史状态，仅使用治理问题记录。"}
+
+
+
+# Sprint 53: standards mapping review queue
+@app.get("/api/v1/standards/mappings/review-queue")
+def standards_mapping_review_queue(
+    status: str = "待核验",
+    standard_id: int | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    _user: User = Depends(require_permission("governance:read")),
+    db: Session = Depends(db_session),
+):
+    allowed_statuses = {"待核验", "已落标", "不符合", "全部"}
+    if status not in allowed_statuses:
+        raise HTTPException(422, "状态筛选无效")
+    if limit < 1 or limit > 200 or offset < 0:
+        raise HTTPException(422, "分页参数无效：limit 为 1-200，offset 必须大于等于 0")
+    query = select(DataStandardMapping, DataStandardVersion, DataStandard, MetadataColumn, MetadataTable, DataSource).join(
+        DataStandardVersion, DataStandardMapping.version_id == DataStandardVersion.id
+    ).join(DataStandard, DataStandardVersion.standard_id == DataStandard.id
+    ).join(MetadataColumn, DataStandardMapping.metadata_column_id == MetadataColumn.id
+    ).join(MetadataTable, MetadataColumn.table_id == MetadataTable.id
+    ).join(DataSource, MetadataTable.source_id == DataSource.id)
+    if status != "全部":
+        query = query.where(DataStandardMapping.mapping_status == status)
+    if standard_id is not None:
+        query = query.where(DataStandard.id == standard_id)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.execute(query.order_by(DataStandardMapping.mapped_at.desc(), DataStandardMapping.id.desc()).offset(offset).limit(limit)).all()
+    return {"total": total, "limit": limit, "offset": offset, "items": [
+        {"mapping_id": mapping.id, "mapping_status": mapping.mapping_status, "note": mapping.note,
+         "mapped_at": mapping.mapped_at, "standard_id": standard.id, "standard_code": standard.standard_code,
+         "standard_name": standard.name, "version_number": version.version_number,
+         "column_id": column.id, "column_name": column.column_name, "data_type": column.data_type,
+         "table_id": table.id, "schema_name": table.schema_name, "table_name": table.table_name,
+         "source_name": source.name}
+        for mapping, version, standard, column, table, source in rows]}
+
+
+# Sprint 52: bulk standard-field mapping endpoint.
+@app.post("/api/v1/standards/{standard_id}/versions/{version_id}/mappings/bulk", status_code=201)
+def bulk_create_standard_mappings(
+    standard_id: int,
+    version_id: int,
+    payload: dict,
+    _user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    """Create or update a bounded batch of mappings for one standard version."""
+    version = db.get(DataStandardVersion, version_id)
+    if not version or version.standard_id != standard_id:
+        raise HTTPException(404, "标准版本不存在")
+    items = payload.get("mappings")
+    if not isinstance(items, list) or not items or len(items) > 500:
+        raise HTTPException(422, "mappings 必须为 1-500 条记录的数组")
+    allowed_statuses = {"待核验", "已落标", "不符合"}
+    normalized = []
+    seen_column_ids = set()
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("metadata_column_id"), int):
+            raise HTTPException(422, "每条映射必须包含整数 metadata_column_id")
+        column_id = item["metadata_column_id"]
+        if column_id in seen_column_ids:
+            raise HTTPException(422, "批次中不能重复包含同一字段")
+        seen_column_ids.add(column_id)
+        status = item.get("mapping_status", "待核验")
+        note = item.get("note", "")
+        if status not in allowed_statuses or not isinstance(note, str) or len(note) > 2000:
+            raise HTTPException(422, "mapping_status 或 note 无效")
+        column = db.get(MetadataColumn, column_id)
+        if not column:
+            raise HTTPException(404, f"元数据字段 {column_id} 不存在")
+        normalized.append((column_id, status, note))
+    results = []
+    for column_id, status, note in normalized:
+        existing = db.scalar(select(DataStandardMapping).where(
+            DataStandardMapping.version_id == version_id,
+            DataStandardMapping.metadata_column_id == column_id,
+        ))
+        if existing:
+            existing.mapping_status = status
+            existing.note = note
+            existing.mapped_at = datetime.utcnow()
+            mapping = existing
+        else:
+            mapping = DataStandardMapping(version_id=version_id, metadata_column_id=column_id,
+                                         mapping_status=status, note=note)
+            db.add(mapping)
+        results.append(mapping)
+    db.commit()
+    for mapping in results:
+        db.refresh(mapping)
+    return {"standard_id": standard_id, "version_id": version_id, "count": len(results),
+            "mappings": [{"id": m.id, "metadata_column_id": m.metadata_column_id,
+                          "mapping_status": m.mapping_status, "note": m.note,
+                          "mapped_at": m.mapped_at} for m in results]}
+
+
+# Sprint 57: explicit mapping review decision, with audit trail.
+class MappingReviewIn(BaseModel):
+    mapping_status: str
+    note: str = Field(default="", max_length=2000)
+
+@app.patch("/api/v1/standards/mappings/{mapping_id}/review")
+def review_standard_mapping(
+    mapping_id: int,
+    payload: MappingReviewIn,
+    user: User = Depends(require_permission("governance:write")),
+    db: Session = Depends(db_session),
+):
+    if payload.mapping_status not in {"待核验", "已落标", "不符合"}:
+        raise HTTPException(422, "审核状态无效")
+    mapping = db.get(DataStandardMapping, mapping_id)
+    if mapping is None:
+        raise HTTPException(404, "标准映射不存在")
+    before = mapping.mapping_status
+    mapping.mapping_status = payload.mapping_status
+    mapping.note = payload.note
+    mapping.mapped_at = datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()), actor=user.username, action="UPDATE",
+        resource=f"standard_mapping:{mapping_id}: {before} -> {payload.mapping_status}",
+        http_method="PATCH", path=f"/api/v1/standards/mappings/{mapping_id}/review", status_code=200))
+    db.commit()
+    db.refresh(mapping)
+    return {"mapping_id": mapping.id, "mapping_status": mapping.mapping_status,
+            "note": mapping.note, "mapped_at": mapping.mapped_at}
+
+# Sprint 58–60: audit log query, asset review checklist and governance report.
+@app.get("/api/v1/governance/audit")
+def governance_audit(
+    actor: str | None = None, action: str | None = None, resource: str | None = None,
+    limit: int = 100, offset: int = 0,
+    _user: User = Depends(require_permission("audit:read")), db: Session = Depends(db_session),
+):
+    if limit < 1 or limit > 200 or offset < 0:
+        raise HTTPException(422, "分页参数无效")
+    query = select(AuditLog)
+    if actor: query = query.where(AuditLog.actor.contains(actor))
+    if action: query = query.where(AuditLog.action == action)
+    if resource: query = query.where(AuditLog.resource.contains(resource))
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.scalars(query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).offset(offset).limit(limit)).all()
+    return {"total": total, "limit": limit, "offset": offset, "items": [
+        {"id": r.id, "actor": r.actor, "action": r.action, "resource": r.resource,
+         "method": r.http_method, "path": r.path, "status_code": r.status_code,
+         "request_id": r.request_id, "created_at": r.created_at} for r in rows]}
+
+@app.get("/api/v1/governance/asset-review-checklist")
+def asset_review_checklist(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    assets = db.scalars(select(DataAsset).order_by(DataAsset.id)).all()
+    results = []
+    for asset in assets:
+        table = db.get(MetadataTable, asset.metadata_table_id) if asset.metadata_table_id else None
+        mappings = 0
+        quality_rules = 0
+        if table:
+            column_ids = select(MetadataColumn.id).where(MetadataColumn.table_id == table.id)
+            mappings = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.metadata_column_id.in_(column_ids))) or 0
+            quality_rules = db.scalar(select(func.count(QualityRule.id)).where(QualityRule.metadata_table_id == table.id)) or 0
+        checks = {"business_definition": bool((asset.description or "").strip()), "owner": bool((asset.owner or "").strip()),
+            "department": bool((asset.owner_department or "").strip()), "domain": bool((asset.business_domain or "").strip()),
+            "classification": bool(asset.sensitivity_level and asset.sensitivity_level != "未分级"), "standard_mapping": mappings > 0,
+            "quality_coverage": quality_rules > 0}
+        results.append({"asset_id": asset.id, "asset_code": asset.asset_code, "name": asset.name,
+            "metadata_table_id": asset.metadata_table_id, "checks": checks,
+            "completed": sum(checks.values()), "total_checks": len(checks),
+            "completion_rate": round(sum(checks.values())/len(checks)*100),
+            "mapping_count": mappings, "quality_rule_count": quality_rules})
+    return {"items": results, "basis": "基于已登记资产和治理元数据的自动检查；不代表合规认证。"}
+
+@app.get("/api/v1/governance/review-report")
+def governance_review_report(_user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    checklist = asset_review_checklist(_user=_user, db=db)["items"]
+    total_assets = len(checklist)
+    incomplete = [a for a in checklist if a["completion_rate"] < 100]
+    pending = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.mapping_status == "待核验")) or 0
+    noncompliant = db.scalar(select(func.count(DataStandardMapping.id)).where(DataStandardMapping.mapping_status == "不符合")) or 0
+    return {"generated_at": datetime.utcnow(), "asset_count": total_assets,
+        "checklist_complete": total_assets-len(incomplete), "checklist_incomplete": len(incomplete),
+        "pending_mappings": pending, "noncompliant_mappings": noncompliant,
+        "incomplete_assets": incomplete, "basis": "仅汇总治理元数据和流程记录；未完成的证据明确标示，报告不构成合规认定。"}
+
+# Sprint 87-92: Governance task center and lifecycle
+class GovernanceTask(Base):
+    __tablename__ = "governance_tasks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(240))
+    task_type: Mapped[str] = mapped_column(String(40), default="整改")
+    source_type: Mapped[str] = mapped_column(String(40), default="manual")
+    source_id: Mapped[str] = mapped_column(String(100), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    action_plan: Mapped[str] = mapped_column(Text, default="")
+    owner: Mapped[str] = mapped_column(String(120), default="")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    created_by: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(30), default="待处理", index=True)
+    due_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    close_note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class GovernanceReviewEvent(Base):
+    __tablename__ = "governance_review_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("governance_tasks.id", ondelete="CASCADE"), index=True)
+    reviewer: Mapped[str] = mapped_column(String(120), default="", index=True)
+    decision: Mapped[str] = mapped_column(String(20))
+    comment: Mapped[str] = mapped_column(Text, default="")
+    legacy_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class GovernanceTaskCreate(BaseModel):
+    title: str = Field(min_length=2, max_length=240)
+    task_type: str = Field(default="整改", max_length=40)
+    source_type: str = Field(default="manual", max_length=40)
+    source_id: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=4000)
+    action_plan: str = Field(default="", max_length=4000)
+    owner: str = Field(default="", max_length=120)
+    owner_department: str = Field(default="", max_length=120)
+    due_date: datetime | None = None
+
+class GovernanceTaskUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=2, max_length=240)
+    description: str | None = Field(default=None, max_length=4000)
+    action_plan: str | None = Field(default=None, max_length=4000)
+    owner: str | None = Field(default=None, max_length=120)
+    owner_department: str | None = Field(default=None, max_length=120)
+    due_date: datetime | None = None
+
+class GovernanceTaskAction(BaseModel):
+    note: str = Field(default="", max_length=4000)
+
+def _task_priority(task: GovernanceTask):
+    """Derived priority, tolerating nullable legacy task fields."""
+    text = " ".join(str(value or "") for value in (task.title, task.description, task.task_type)).lower()
+    if any(k in text for k in ("高度敏感", "安全", "重大", "critical", "严重")):
+        return "高"
+    if task.source_type == "quality_run" or task.source_type == "asset_checklist":
+        return "中"
+    return "低"
+
+def _task_public(task: GovernanceTask):
+    return {"id":task.id,"task_code":task.task_code,"title":task.title,"task_type":task.task_type,
+        "priority":_task_priority(task),"source_type":task.source_type,"source_id":task.source_id,"description":task.description,
+        "action_plan":task.action_plan,"owner":task.owner,"owner_department":task.owner_department,
+        "created_by":task.created_by,"status":task.status,"due_date":task.due_date,
+        "close_note":task.close_note,"created_at":task.created_at,"updated_at":task.updated_at,
+        "closed_at":task.closed_at}
+
+@app.post("/api/v1/governance/tasks", status_code=201)
+def create_governance_task(payload: GovernanceTaskCreate,
+    user: User = Depends(require_permission("governance:write")), db: Session = Depends(db_session)):
+    task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=payload.title,
+        task_type=payload.task_type,source_type=payload.source_type,source_id=payload.source_id,
+        description=payload.description,action_plan=payload.action_plan,owner=payload.owner,
+        owner_department=payload.owner_department,created_by=user.username,due_date=payload.due_date)
+    db.add(task);db.flush()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",
+        resource=f"governance_task:{task.task_code}",http_method="POST",
+        path="/api/v1/governance/tasks",status_code=201))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.get("/api/v1/governance/tasks")
+def list_governance_tasks(status: str | None = None, task_type: str | None = None,
+    owner_department: str | None = None, owner: str | None = None, limit: int = 100, offset: int = 0,
+    _user: User = Depends(require_permission("governance:read")), db: Session = Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效")
+    query=select(GovernanceTask)
+    if status: query=query.where(GovernanceTask.status==status)
+    if task_type: query=query.where(GovernanceTask.task_type==task_type)
+    if owner_department: query=query.where(GovernanceTask.owner_department.contains(owner_department))
+    if owner: query=query.where(GovernanceTask.owner.contains(owner))
+    total=db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    tasks=db.scalars(query.order_by(GovernanceTask.updated_at.desc(),GovernanceTask.id.desc()).offset(offset).limit(limit)).all()
+    return {"total":total,"limit":limit,"offset":offset,"items":[_task_public(t) for t in tasks]}
+
+@app.get("/api/v1/governance/tasks/{task_id}")
+def get_governance_task(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    return _task_public(task)
+
+@app.patch("/api/v1/governance/tasks/{task_id}")
+def update_governance_task(task_id:int,payload:GovernanceTaskUpdate,
+    user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status=="已关闭": raise HTTPException(409,"已关闭任务不可编辑")
+    for field,value in payload.model_dump(exclude_unset=True).items(): setattr(task,field,value)
+    task.updated_at=datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",
+        resource=f"governance_task:{task.task_code}",http_method="PATCH",
+        path=f"/api/v1/governance/tasks/{task_id}",status_code=200))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.post("/api/v1/governance/tasks/{task_id}/start")
+def start_governance_task(task_id:int,payload:GovernanceTaskAction,
+    user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status!="待处理": raise HTTPException(409,"仅待处理任务可启动")
+    task.status="处理中";task.updated_at=datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",
+        resource=f"governance_task:{task.task_code}:开始处理",http_method="POST",
+        path=f"/api/v1/governance/tasks/{task_id}/start",status_code=200))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+@app.post("/api/v1/governance/tasks/{task_id}/close")
+def close_governance_task(task_id:int,payload:GovernanceTaskAction,
+    user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    if len(payload.note.strip())<3: raise HTTPException(422,"关闭任务需填写整改结果或复核说明")
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status!="处理中": raise HTTPException(409,"仅处理中任务可关闭")
+    task.status="已关闭";task.close_note=payload.note.strip();task.closed_at=datetime.utcnow();task.updated_at=datetime.utcnow()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",
+        resource=f"governance_task:{task.task_code}:关闭",http_method="POST",
+        path=f"/api/v1/governance/tasks/{task_id}/close",status_code=200))
+    db.commit();db.refresh(task)
+    return _task_public(task)
+
+# Sprint 99: checklist-driven task generation with source-level deduplication.
+@app.post("/api/v1/governance/tasks/generate-from-checklist")
+def generate_tasks_from_asset_checklist(user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    checklist=asset_review_checklist(_user=user,db=db)["items"]
+    check_titles={"business_definition":"补充资产业务定义","owner":"明确资产责任人","department":"明确资产责任部门","domain":"补充业务域","classification":"完成敏感级别分级","standard_mapping":"补充数据标准映射","quality_coverage":"建立数据质量规则"}
+    created=[]; skipped=0
+    for item in checklist:
+        for check_key,passed in item["checks"].items():
+            if passed: continue
+            source_key=f'{item["asset_id"]}:{check_key}'
+            existing=db.scalar(select(GovernanceTask.id).where(GovernanceTask.source_type=="asset_checklist",GovernanceTask.source_id==source_key))
+            if existing: skipped+=1; continue
+            task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=f'{check_titles.get(check_key,"完善治理项")}：{item["name"]}',task_type="资产治理",source_type="asset_checklist",source_id=source_key,description=f'资产 {item["asset_code"]} / {item["name"]} 未通过治理检查项：{check_key}',action_plan=check_titles.get(check_key,"完成治理检查项"),created_by=user.username)
+            db.add(task);db.flush();created.append(task)
+            db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:auto_asset_check",http_method="POST",path="/api/v1/governance/tasks/generate-from-checklist",status_code=201))
+    db.commit()
+    return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅依据登记的资产治理元数据检查项生成任务；未读取业务数据。"}
+
+# Sprint 100: standard mapping follow-up task generation.
+@app.post("/api/v1/governance/tasks/generate-from-mappings")
+def generate_tasks_from_mapping_review(user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(DataStandardMapping).where(DataStandardMapping.mapping_status.in_(["待核验","不符合"]))).all()
+    created=[];skipped=0
+    for mapping in rows:
+        source_key=str(mapping.id)
+        existing=db.scalar(select(GovernanceTask.id).where(GovernanceTask.source_type=="standard_mapping",GovernanceTask.source_id==source_key))
+        if existing: skipped+=1;continue
+        column=db.get(MetadataColumn,mapping.metadata_column_id)
+        title=f'核验标准映射：{column.column_name if column else "字段"}'
+        task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=title,task_type="标准映射",source_type="standard_mapping",source_id=source_key,description=f'映射记录 {mapping.id} 状态为 {mapping.mapping_status}，请完成核验或修正。',action_plan="核验字段业务含义、标准匹配和映射状态",created_by=user.username)
+        db.add(task);db.flush();created.append(task)
+        db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:auto_mapping_review",http_method="POST",path="/api/v1/governance/tasks/generate-from-mappings",status_code=201))
+    db.commit()
+    return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅基于标准映射状态生成治理任务，不读取业务数据。"}
+
+# Sprint 101: create remediation tasks from recorded failed quality runs.
+@app.post("/api/v1/governance/tasks/generate-from-quality-runs")
+def generate_tasks_from_quality_runs(user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    runs=db.scalars(select(QualityRun).where(QualityRun.failed_count>0).order_by(QualityRun.id.desc()).limit(500)).all()
+    created=[];skipped=0
+    for run in runs:
+        source_key=str(run.id)
+        existing=db.scalar(select(GovernanceTask.id).where(GovernanceTask.source_type=="quality_run",GovernanceTask.source_id==source_key))
+        if existing:skipped+=1;continue
+        rule=db.get(QualityRule,run.rule_id)
+        task=GovernanceTask(task_code="GT-"+uuid4().hex[:12].upper(),title=f'数据质量整改：{rule.name if rule else "规则"}',task_type="数据质量",source_type="quality_run",source_id=source_key,description=f'质量检测记录 {run.id} 有 {run.failed_count} 条异常（检测总数 {run.total_count}，通过率 {run.pass_rate}%）。请分析并整改。',action_plan="核查异常原因，修复或解释数据问题并再次执行质量检测",created_by=user.username)
+        db.add(task);db.flush();created.append(task)
+        db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:auto_quality",http_method="POST",path="/api/v1/governance/tasks/generate-from-quality-runs",status_code=201))
+    db.commit()
+    return {"created_count":len(created),"skipped_existing":skipped,"items":[_task_public(t) for t in created],"basis":"仅基于已记录的数据质量检测结果生成任务，不执行额外数据扫描。"}
+
+@app.get("/api/v1/governance/tasks-summary")
+def governance_tasks_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceTask)).all()
+    return {"total":len(rows),"pending":sum(t.status=="待处理" for t in rows),
+        "in_progress":sum(t.status=="处理中" for t in rows),"closed":sum(t.status=="已关闭" for t in rows),
+        "overdue":sum(bool(t.status!="已关闭" and t.due_date is not None and t.due_date<datetime.utcnow()) for t in rows),
+        "closure_rate":round(sum(t.status=="已关闭" for t in rows)/len(rows)*100,2) if rows else 0}
+
+# Sprint 109–110: department-level task execution metrics.
+@app.get("/api/v1/governance/tasks-department-summary")
+def governance_tasks_department_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceTask)).all()
+    grouped={}
+    now=datetime.utcnow()
+    for task in rows:
+        dept=task.owner_department.strip() or "未分配部门"
+        item=grouped.setdefault(dept,{"department":dept,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0,"high_priority":0})
+        item["total"]+=1
+        item["pending"]+=int(task.status=="待处理")
+        item["in_progress"]+=int(task.status=="处理中")
+        item["closed"]+=int(task.status=="已关闭")
+        item["overdue"]+=int(task.status!="已关闭" and task.due_date is not None and task.due_date<now)
+        item["high_priority"]+=int(_task_priority(task)=="高")
+    for item in grouped.values():
+        item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
+    return {"departments":sorted(grouped.values(),key=lambda x:(-x["overdue"],-x["pending"],x["department"]))}
+
+
+# Sprint 129-134: richer task operations aggregation, including department and owner workload and monthly trend.
+@app.get("/api/v1/governance/tasks-operations-overview")
+def governance_tasks_operations_overview(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceTask)).all()
+    now=datetime.utcnow()
+    by_source={}
+    by_status={}
+    by_priority={}
+    by_department={}
+    by_owner={}
+    aging={"0-7_days":0,"8-30_days":0,"31-90_days":0,"over_90_days":0}
+    unassigned=0
+    overdue=0
+    closed=0
+    monthly={}
+    for task in rows:
+        source=task.source_type or "unknown"
+        status=task.status or "unknown"
+        priority=_task_priority(task)
+        dept=(task.owner_department or "").strip() or "未分配部门"
+        owner=(task.owner or "").strip() or "未分配责任人"
+        by_source[source]=by_source.get(source,0)+1
+        by_status[status]=by_status.get(status,0)+1
+        by_priority[priority]=by_priority.get(priority,0)+1
+        unassigned+=int(owner=="未分配责任人")
+        closed+=int(status=="已关闭")
+        is_overdue=status!="已关闭" and task.due_date is not None and task.due_date<now
+        overdue+=int(is_overdue)
+        dept_item=by_department.setdefault(dept,{"department":dept,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0,"high_priority":0})
+        dept_item["total"]+=1
+        dept_item["pending"]+=int(status in ("待处理","待分派","未开始"))
+        dept_item["in_progress"]+=int(status in ("处理中","进行中"))
+        dept_item["closed"]+=int(status=="已关闭")
+        dept_item["overdue"]+=int(is_overdue)
+        dept_item["high_priority"]+=int(priority=="高")
+        owner_item=by_owner.setdefault(owner,{"owner":owner,"total":0,"pending":0,"in_progress":0,"closed":0,"overdue":0})
+        owner_item["total"]+=1
+        owner_item["pending"]+=int(status in ("待处理","待分派","未开始"))
+        owner_item["in_progress"]+=int(status in ("处理中","进行中"))
+        owner_item["closed"]+=int(status=="已关闭")
+        owner_item["overdue"]+=int(is_overdue)
+        age=max(0,(now-task.created_at).days) if task.created_at else 0
+        if age<=7: aging["0-7_days"]+=1
+        elif age<=30: aging["8-30_days"]+=1
+        elif age<=90: aging["31-90_days"]+=1
+        else: aging["over_90_days"]+=1
+        month=task.created_at.strftime("%Y-%m") if task.created_at else "unknown"
+        monthly.setdefault(month,{"month":month,"created":0,"closed":0})["created"]+=1
+        if status=="已关闭":
+            close_month=task.closed_at.strftime("%Y-%m") if task.closed_at else month
+            monthly.setdefault(close_month,{"month":close_month,"created":0,"closed":0})["closed"]+=1
+    for item in by_department.values():
+        item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
+    for item in by_owner.values():
+        item["closure_rate"]=round(item["closed"]/item["total"]*100,2) if item["total"] else 0
+    total=len(rows)
+    return {"generated_at":now,"scope":"all governance tasks; count-only aggregation",
+        "total":total,"closed":closed,"overdue":overdue,"unassigned_owner":unassigned,
+        "closure_rate":round(closed/total*100,2) if total else 0,
+        "by_source":dict(sorted(by_source.items())),
+        "by_status":dict(sorted(by_status.items())),
+        "by_priority":dict(sorted(by_priority.items())),
+        "by_department":sorted(by_department.values(),key=lambda x:(-x["overdue"],-x["pending"],x["department"])),
+        "by_owner":sorted(by_owner.values(),key=lambda x:(-x["overdue"],-x["pending"],x["owner"])),
+        "aging_buckets":aging,"monthly_trend":[monthly[k] for k in sorted(monthly)],
+        "disclaimer":"Operational aggregation only; closure period uses closed_at when available; not an HR or departmental performance rating."}
+
+
+# Sprint 135-140: remediation evidence and auditable task close-loop
+class GovernanceTaskEvidenceIn(BaseModel):
+    evidence_type: str = Field(default="整改说明", min_length=1, max_length=40)
+    title: str = Field(min_length=2, max_length=180)
+    description: str = Field(default="", max_length=4000)
+    reference_url: str = Field(default="", max_length=1000)
+
+@app.get("/api/v1/governance/tasks/{task_id}/evidence")
+def list_governance_task_evidence(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    rows=db.scalars(select(Record).where(Record.category=="task_evidence").order_by(Record.created_at.desc())).all()
+    items=[]
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("task_id")==task_id:
+            items.append({"id":row.id,"task_id":task_id,"evidence_type":payload.get("evidence_type",""),"title":row.name,"description":payload.get("description",""),"reference_url":payload.get("reference_url",""),"created_by":payload.get("created_by",""),"created_at":row.created_at})
+    return {"task_id":task_id,"items":items,"total":len(items)}
+
+@app.post("/api/v1/governance/tasks/{task_id}/evidence",status_code=201)
+def add_governance_task_evidence(task_id:int,payload:GovernanceTaskEvidenceIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status=="已关闭": raise HTTPException(409,"已关闭任务不可追加整改证据")
+    data={"task_id":task_id,"evidence_type":payload.evidence_type,"description":payload.description,"reference_url":payload.reference_url,"created_by":user.username}
+    row=Record(category="task_evidence",name=payload.title,description=json.dumps(data,ensure_ascii=False),status="已提交",owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_task:{task.task_code}:evidence",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/evidence",status_code=201))
+    db.commit();db.refresh(row)
+    return {"id":row.id,"task_id":task_id,"evidence_type":payload.evidence_type,"title":row.name,"description":payload.description,"reference_url":payload.reference_url,"created_by":user.username,"created_at":row.created_at}
+
+@app.get("/api/v1/governance/tasks-closed-loop-report")
+def governance_tasks_closed_loop_report(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    tasks=db.scalars(select(GovernanceTask)).all()
+    evidence_rows=db.scalars(select(Record).where(Record.category=="task_evidence")).all()
+    evidence_by_task={}
+    for row in evidence_rows:
+        try: task_id=json.loads(row.description or "{}").get("task_id")
+        except (TypeError,json.JSONDecodeError): task_id=None
+        if isinstance(task_id,int): evidence_by_task[task_id]=evidence_by_task.get(task_id,0)+1
+    now=datetime.utcnow(); counts={"total":len(tasks),"pending":0,"in_progress":0,"closed":0,"overdue":0,"with_evidence":0,"without_evidence":0}
+    by_source={};by_department={}
+    for t in tasks:
+        counts["pending"]+=int(t.status=="待处理");counts["in_progress"]+=int(t.status=="处理中");counts["closed"]+=int(t.status=="已关闭")
+        counts["overdue"]+=int(t.status!="已关闭" and t.due_date is not None and t.due_date<now)
+        has=evidence_by_task.get(t.id,0)>0;counts["with_evidence"]+=int(has);counts["without_evidence"]+=int(not has)
+        for grouping,key in ((by_source,t.source_type or "unknown"),(by_department,(t.owner_department or "").strip() or "未分配部门")):
+            item=grouping.setdefault(key,{"name":key,"total":0,"closed":0,"overdue":0,"evidence_tasks":0})
+            item["total"]+=1;item["closed"]+=int(t.status=="已关闭");item["overdue"]+=int(t.status!="已关闭" and t.due_date is not None and t.due_date<now);item["evidence_tasks"]+=int(has)
+    counts["closure_rate"]=round(counts["closed"]/counts["total"]*100,2) if counts["total"] else 0
+    return {"generated_at":now,"summary":counts,"by_source":sorted(by_source.values(),key=lambda x:x["name"]),"by_department":sorted(by_department.values(),key=lambda x:x["name"]),"evidence_records":sum(evidence_by_task.values()),"scope":"仅统计工作台治理任务及登记证据；证据登记不代表独立验收或自动复测通过。"}
+
+# Sprint 141-146: independent remediation review workflow, stored in Record metadata
+class GovernanceTaskReviewIn(BaseModel):
+    decision: str = Field(min_length=2, max_length=20)
+    comment: str = Field(default="", max_length=4000)
+
+@app.get("/api/v1/governance/tasks/{task_id}/reviews")
+def list_governance_task_reviews(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    rows=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.created_at.desc())).all()
+    items=[]
+    for row in rows:
+        try: data=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if data.get("task_id")==task_id: items.append({"id":row.id,"task_id":task_id,"decision":data.get("decision"),"comment":data.get("comment"),"reviewer":data.get("reviewer"),"created_at":row.created_at})
+    return {"items":items,"total":len(items)}
+
+@app.post("/api/v1/governance/tasks/{task_id}/reviews",status_code=201)
+def review_governance_task(task_id:int,payload:GovernanceTaskReviewIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if not task: raise HTTPException(404,"治理任务不存在")
+    if task.status=="已关闭": raise HTTPException(409,"已关闭任务不接受验收操作")
+    decision=payload.decision.strip()
+    if decision not in ("通过","退回"): raise HTTPException(422,"decision仅允许通过或退回")
+    if task.owner and task.owner.strip()==user.username: raise HTTPException(403,"整改责任人不能自行验收")
+    evidence=db.scalars(select(Record).where(Record.category=="task_evidence")).all()
+    has_evidence=False
+    for row in evidence:
+        try:
+            if json.loads(row.description or "{}").get("task_id")==task_id: has_evidence=True;break
+        except (TypeError,json.JSONDecodeError): pass
+    if decision=="通过" and not has_evidence: raise HTTPException(409,"验收通过前必须登记整改证据")
+    data={"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username}
+    row=Record(category="task_review",name=f"{task.task_code}验收{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
+    db.add(row);db.flush()
+    db.add(GovernanceReviewEvent(task_id=task_id,reviewer=user.username,decision=decision,comment=payload.comment,legacy_record_id=row.id))
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"governance_task:{task.task_code}:review",http_method="POST",path=f"/api/v1/governance/tasks/{task_id}/reviews",status_code=201))
+    db.commit();db.refresh(row)
+    return {"id":row.id,"task_id":task_id,"decision":decision,"comment":payload.comment,"reviewer":user.username,"created_at":row.created_at}
+
+@app.get("/api/v1/governance/tasks-acceptance-report")
+def governance_tasks_acceptance_report(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    tasks=db.scalars(select(GovernanceTask)).all()
+    event_rows=db.scalars(select(GovernanceReviewEvent).order_by(GovernanceReviewEvent.id.desc())).all()
+    reviews={}
+    for event in event_rows:
+        if event.task_id not in reviews and event.decision in ("通过","退回"): reviews[event.task_id]=event.decision
+    # Legacy fallback only for tasks not yet represented in the event table.
+    legacy_rows=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    legacy_reviews={}
+    for row in legacy_rows:
+        try: data=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        tid=data.get("task_id"); decision=data.get("decision")
+        if isinstance(tid,int) and tid not in legacy_reviews and decision in ("通过","退回"): legacy_reviews[tid]=decision
+    for tid,decision in legacy_reviews.items():
+        if tid not in reviews: reviews[tid]=decision
+    accepted=sum(1 for decision in reviews.values() if decision=="通过")
+    returned=sum(1 for decision in reviews.values() if decision=="退回")
+    reviewed=len(reviews); total=len(tasks)
+    return {"total_tasks":total,"reviewed_tasks":reviewed,"accepted_tasks":accepted,"returned_tasks":returned,"unreviewed_tasks":max(0,total-reviewed),"acceptance_rate":round(accepted/reviewed*100,2) if reviewed else 0,"review_records":len(event_rows)+len(legacy_rows),"scope":"优先读取专用验收事件；无专用事件任务回退读取旧Record记录。"}
+
+# Sprint 219-224: audit timeline and event-link consistency checks.
+@app.get("/api/v1/governance/tasks/{task_id}/review-history")
+def governance_task_review_history(task_id:int,limit:int=100,offset:int=0,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效：limit 为 1-200，offset 必须大于等于 0")
+    task=db.get(GovernanceTask,task_id)
+    if task is None: raise HTTPException(404,"治理任务不存在")
+    events=db.scalars(select(GovernanceReviewEvent).where(GovernanceReviewEvent.task_id==task_id).order_by(GovernanceReviewEvent.id.desc())).all()
+    linked_ids={event.legacy_record_id for event in events if event.legacy_record_id is not None}
+    legacy=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    items=[{"event_id":event.id,"legacy_record_id":event.legacy_record_id,"decision":event.decision,"reviewer":event.reviewer,"comment":event.comment,"created_at":event.created_at,"source":"event"} for event in events]
+    for row in legacy:
+        if row.id in linked_ids: continue
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("task_id")==task_id and payload.get("decision") in ("通过","退回"):
+            items.append({"event_id":None,"legacy_record_id":row.id,"decision":payload.get("decision"),"reviewer":payload.get("reviewer") or row.owner,"comment":payload.get("comment") or "","created_at":row.created_at,"source":"legacy"})
+    items.sort(key=lambda item:(item["created_at"] or datetime.min,item["legacy_record_id"] or 0),reverse=True)
+    total=len(items)
+    return {"task_id":task_id,"task_code":task.task_code,"history":items[offset:offset+limit],"count":total,"limit":limit,"offset":offset,"has_more":offset+limit<total}
+
+@app.get("/api/v1/governance/review-event-integrity")
+def governance_review_event_integrity(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    events=db.scalars(select(GovernanceReviewEvent)).all()
+    task_ids=set(db.scalars(select(GovernanceTask.id)).all())
+    record_ids=set(db.scalars(select(Record.id).where(Record.category=="task_review")).all())
+    missing_task=[];missing_legacy=[];invalid=[]
+    for event in events:
+        if event.task_id not in task_ids: missing_task.append(event.id)
+        if event.legacy_record_id is not None and event.legacy_record_id not in record_ids: missing_legacy.append(event.id)
+        if event.decision not in ("通过","退回"): invalid.append(event.id)
+    return {"event_count":len(events),"orphan_task_event_ids":missing_task,"missing_legacy_record_event_ids":missing_legacy,"invalid_decision_event_ids":invalid,"integrity_ok":not(missing_task or missing_legacy or invalid)}
+
+
+@app.get("/api/v1/governance/tasks/{task_id}/review-history/export")
+def export_governance_task_review_history(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    history=governance_task_review_history(task_id,limit=200,offset=0,_user=_user,db=db)
+    if history["count"]>200: raise HTTPException(422,"记录超过200条，请分页查询后分别导出")
+    import csv,io
+    output=io.StringIO(newline="")
+    writer=csv.writer(output)
+    writer.writerow(["task_id","task_code","event_id","legacy_record_id","decision","reviewer","comment","created_at","source"])
+    for item in history["history"]:
+        writer.writerow([task_id,history["task_code"],item["event_id"],item["legacy_record_id"],item["decision"],item["reviewer"],item["comment"],item["created_at"],item["source"]])
+    csv_content="\\ufeff"+output.getvalue()
+    return Response(content=csv_content,media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=task-{task_id}-review-history.csv"})
+
+
+# Sprint 225-230: paginated integrity diagnostics and larger bounded CSV export.
+@app.get("/api/v1/governance/review-event-integrity-expanded")
+def governance_review_event_integrity_expanded(limit:int=100,offset:int=0,category:str="全部",status:str="全部",_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效：limit 为 1-200，offset 必须大于等于 0")
+    allowed_categories=("全部","orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record")
+    if category not in allowed_categories: raise HTTPException(422,"异常类别筛选值无效")
+    events=db.scalars(select(GovernanceReviewEvent).order_by(GovernanceReviewEvent.id.desc())).all()
+    tasks=set(db.scalars(select(GovernanceTask.id)).all())
+    records=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    record_ids={row.id for row in records};record_payloads={};invalid_records=[]
+    for row in records:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): invalid_records.append(row.id);continue
+        tid=payload.get("task_id");decision=payload.get("decision")
+        if isinstance(tid,int) and decision in ("通过","退回"): record_payloads[row.id]=payload
+    missing_task=[];missing_record=[];invalid_decision=[];duplicate_task_decisions=[];seen_task_decisions=set()
+    for event in events:
+        if event.task_id not in tasks: missing_task.append(event.id)
+        if event.legacy_record_id is not None and event.legacy_record_id not in record_ids: missing_record.append(event.id)
+        if event.decision not in ("通过","退回"): invalid_decision.append(event.id)
+        if event.task_id in seen_task_decisions: duplicate_task_decisions.append(event.id)
+        seen_task_decisions.add(event.task_id)
+    linked={event.legacy_record_id for event in events if event.legacy_record_id is not None}
+    unlinked_legacy=[rid for rid in record_payloads if rid not in linked]
+    issues=[]
+    for category,ids in (("orphan_task_event",missing_task),("missing_legacy_link",missing_record),("invalid_event_decision",invalid_decision),("duplicate_task_event",duplicate_task_decisions),("unlinked_legacy_review",unlinked_legacy),("malformed_legacy_record",invalid_records)):
+        issues.extend({"category":category,"record_id":rid} for rid in ids)
+    if category!="全部": issues=[issue for issue in issues if issue["category"]==category]
+    action_rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    action_status={}
+    for row in action_rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        action_status[(payload.get("issue_category"),payload.get("issue_record_id"))]=row.status
+    status_counts={"未登记":0,"待处理":0,"处理中":0,"已解决":0,"已确认非问题":0}
+    for issue in issues:
+        state=action_status.get((issue["category"],issue["record_id"]),"未登记")
+        status_counts[state]=status_counts.get(state,0)+1
+    if status!="全部":
+        if status not in status_counts: raise HTTPException(422,"异常处置状态筛选值无效")
+        issues=[issue for issue in issues if action_status.get((issue["category"],issue["record_id"]),"未登记")==status]
+    total=len(issues)
+    return {"event_count":len(events),"legacy_review_records":len(records),"issue_count":total,"issues":issues[offset:offset+limit],"total":total,"category":category,"status":status,"status_counts":status_counts,"limit":limit,"offset":offset,"has_more":offset+limit<total,"scope":"Read-only diagnostic; server-side category/status filtering and offset/limit apply after diagnostic generation. No automatic repair."}
+
+@app.get("/api/v1/governance/tasks/{task_id}/review-history/export-v2")
+def export_governance_task_review_history_v2(task_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    task=db.get(GovernanceTask,task_id)
+    if task is None: raise HTTPException(404,"治理任务不存在")
+    events=db.scalars(select(GovernanceReviewEvent).where(GovernanceReviewEvent.task_id==task_id).order_by(GovernanceReviewEvent.id.desc())).all()
+    linked_ids={event.legacy_record_id for event in events if event.legacy_record_id is not None}
+    legacy=db.scalars(select(Record).where(Record.category=="task_review").order_by(Record.id.desc())).all()
+    items=[{"event_id":event.id,"legacy_record_id":event.legacy_record_id,"decision":event.decision,"reviewer":event.reviewer,"comment":event.comment,"created_at":event.created_at,"source":"event"} for event in events]
+    for row in legacy:
+        if row.id in linked_ids: continue
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("task_id")==task_id and payload.get("decision") in ("通过","退回"):
+            items.append({"event_id":None,"legacy_record_id":row.id,"decision":payload.get("decision"),"reviewer":payload.get("reviewer") or row.owner,"comment":payload.get("comment") or "","created_at":row.created_at,"source":"legacy"})
+    items.sort(key=lambda item:(item["created_at"] or datetime.min,item["legacy_record_id"] or 0),reverse=True)
+    if len(items)>2000: raise HTTPException(422,"该任务验收记录超过2000条，需通过分页历史接口分段获取")
+    import csv,io
+    output=io.StringIO(newline="");writer=csv.writer(output)
+    writer.writerow(["export_generated_at",datetime.utcnow().isoformat(),"task_id",task_id,"task_code",task.task_code])
+    writer.writerow(["event_id","legacy_record_id","decision","reviewer","comment","created_at","source"])
+    for item in items: writer.writerow([item["event_id"],item["legacy_record_id"],item["decision"],item["reviewer"],item["comment"],item["created_at"],item["source"]])
+    content="\\ufeff"+output.getvalue()
+    return Response(content=content,media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=task-{task_id}-review-history-v2.csv"})
+
+
+# Sprint 231-236: actionable review-integrity anomaly registry (stored as governance Records).
+class ReviewIntegrityActionIn(BaseModel):
+    issue_category: str = Field(min_length=2, max_length=80)
+    issue_record_id: int = Field(ge=1)
+    status: str = Field(default="待处理", max_length=20)
+    note: str = Field(default="", max_length=4000)
+
+@app.get("/api/v1/governance/review-integrity-actions")
+def list_review_integrity_actions(limit:int=100,offset:int=0,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200 or offset<0: raise HTTPException(422,"分页参数无效")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action").order_by(Record.id.desc())).all()
+    items=[]
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        items.append({"id":row.id,"issue_category":payload.get("issue_category"),"issue_record_id":payload.get("issue_record_id"),"status":row.status,"note":payload.get("note",""),"owner":row.owner,"created_at":row.created_at})
+    return {"items":items[offset:offset+limit],"total":len(items),"limit":limit,"offset":offset,"has_more":offset+limit<len(items)}
+
+@app.post("/api/v1/governance/review-integrity-actions",status_code=201)
+def create_review_integrity_action(payload:ReviewIntegrityActionIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    category=payload.issue_category.strip();status=payload.status.strip();note=payload.note.strip()
+    allowed=("待处理","处理中","已解决","已确认非问题")
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record"): raise HTTPException(422,"未知异常类别")
+    if status not in allowed: raise HTTPException(422,"状态值无效")
+    if payload.issue_record_id<1: raise HTTPException(422,"异常记录ID无效")
+    key={"issue_category":category,"issue_record_id":payload.issue_record_id}
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    for row in rows:
+        try: existing=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if existing.get("issue_category")==category and existing.get("issue_record_id")==payload.issue_record_id:
+            history=existing.get("history",[])
+            history.append({"status":status,"note":note,"actor":user.username,"changed_at":datetime.utcnow().isoformat(),"previous_status":row.status})
+            existing["history"]=history[-100:]
+            existing["note"]=note
+            row.description=json.dumps(existing,ensure_ascii=False)
+            row.status=status;row.owner=user.username
+            db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=200))
+            db.commit();db.refresh(row)
+            return {"id":row.id,**key,"status":row.status,"note":note,"owner":row.owner,"created_at":row.created_at}
+    row=Record(category="review_integrity_action",name=f"{category}:{payload.issue_record_id}",description=json.dumps({**key,"note":note,"history":[{"status":status,"note":note,"actor":user.username,"changed_at":datetime.utcnow().isoformat(),"previous_status":None}]},ensure_ascii=False),status=status,owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"review_integrity:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-actions",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,**key,"status":row.status,"note":note,"owner":row.owner,"created_at":row.created_at}
+
+# Sprint 243-248: resolve diagnostic references without mutating historical records.
+@app.get("/api/v1/governance/review-event-integrity-detail")
+def review_integrity_detail(category:str,record_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    allowed=("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record")
+    if category not in allowed or record_id<1: raise HTTPException(422,"异常定位参数无效")
+    detail={"category":category,"record_id":record_id,"resolved":False,"references":[]}
+    if category in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event"):
+        event=db.get(GovernanceReviewEvent,record_id)
+        if event:
+            task=db.get(GovernanceTask,event.task_id)
+            legacy=db.get(Record,event.legacy_record_id) if event.legacy_record_id else None
+            detail.update({"resolved":True,"event":{"id":event.id,"task_id":event.task_id,"decision":event.decision,"reviewer":event.reviewer,"comment":event.comment,"created_at":event.created_at},"task":({"id":task.id,"task_code":task.task_code,"title":task.title,"status":task.status,"owner":task.owner} if task else None),"legacy_record":({"id":legacy.id,"name":legacy.name,"status":legacy.status,"created_at":legacy.created_at} if legacy else None)})
+    else:
+        row=db.get(Record,record_id)
+        if row and row.category=="task_review":
+            try: payload=json.loads(row.description or "{}")
+            except (TypeError,json.JSONDecodeError): payload={}
+            detail.update({"resolved":True,"legacy_record":{"id":row.id,"name":row.name,"status":row.status,"owner":row.owner,"created_at":row.created_at},"payload":payload})
+    return detail
+
+@app.get("/api/v1/governance/review-integrity-action-history")
+def review_integrity_action_history(category:str,record_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or record_id<1: raise HTTPException(422,"异常定位参数无效")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("issue_category")==category and payload.get("issue_record_id")==record_id:
+            history=payload.get("history",[])
+            return {"action_id":row.id,"category":category,"record_id":record_id,"history":history[-100:]}
+    return {"action_id":None,"category":category,"record_id":record_id,"history":[]}
+
+@app.get("/api/v1/governance/review-integrity-action-summary")
+def review_integrity_action_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all()
+    counts={"total":len(rows),"待处理":0,"处理中":0,"已解决":0,"已确认非问题":0}
+    by_category={}
+    for row in rows:
+        counts[row.status]=counts.get(row.status,0)+1
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): payload={}
+        cat=payload.get("issue_category","未知")
+        by_category[cat]=by_category.get(cat,0)+1
+    return {"summary":counts,"by_category":by_category,"scope":"仅统计已登记的异常处理记录；不自动修复验收事件或历史数据。"}
+
+# Sprint 265: independent review records for resolved anomaly actions.
+class IntegrityActionReviewIn(BaseModel):
+    issue_category: str = Field(min_length=2, max_length=80)
+    issue_record_id: int = Field(ge=1)
+    decision: str = Field(min_length=2, max_length=20)
+    comment: str = Field(default="", max_length=4000)
+
+@app.get("/api/v1/governance/review-integrity-action-reviews")
+def list_integrity_action_reviews(category:str,record_id:int,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or record_id<1: raise HTTPException(422,"异常定位参数无效")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action_review").order_by(Record.id.desc())).all(); items=[]
+    for row in rows:
+        try: payload=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if payload.get("issue_category")==category and payload.get("issue_record_id")==record_id: items.append({"id":row.id,**payload,"created_at":row.created_at})
+    return {"items":items,"total":len(items)}
+
+@app.post("/api/v1/governance/review-integrity-action-reviews",status_code=201)
+def create_integrity_action_review(payload:IntegrityActionReviewIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    category=payload.issue_category.strip(); decision=payload.decision.strip()
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or payload.issue_record_id<1: raise HTTPException(422,"异常定位参数无效")
+    if decision not in ("通过","退回"): raise HTTPException(422,"复核决策仅允许通过或退回")
+    rows=db.scalars(select(Record).where(Record.category=="review_integrity_action")).all(); target=None
+    for row in rows:
+        try: data=json.loads(row.description or "{}")
+        except (TypeError,json.JSONDecodeError): continue
+        if data.get("issue_category")==category and data.get("issue_record_id")==payload.issue_record_id: target=row;break
+    if target is None: raise HTTPException(404,"尚未登记该异常的处置记录")
+    if target.status!="已解决": raise HTTPException(409,"异常处置状态为已解决后才可独立复核")
+    if target.owner and target.owner.strip()==user.username: raise HTTPException(403,"处置登记人不能自行复核")
+    data={"issue_category":category,"issue_record_id":payload.issue_record_id,"decision":decision,"comment":payload.comment.strip(),"reviewer":user.username}
+    row=Record(category="review_integrity_action_review",name=f"异常复核{decision}",description=json.dumps(data,ensure_ascii=False),status=decision,owner=user.username)
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="REVIEW",resource=f"review_integrity_action:{category}:{payload.issue_record_id}",http_method="POST",path="/api/v1/governance/review-integrity-action-reviews",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,**data,"created_at":row.created_at}
+
+# Sprint 264: correlated audit-log lookup for anomaly registry operations.
+@app.get("/api/v1/governance/review-integrity-action-audit")
+def integrity_action_audit(category:str,record_id:int,limit:int=50,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if category not in ("orphan_task_event","missing_legacy_link","invalid_event_decision","duplicate_task_event","unlinked_legacy_review","malformed_legacy_record") or record_id<1 or limit<1 or limit>100: raise HTTPException(422,"查询参数无效")
+    resource=f"review_integrity:{category}:{record_id}"; pattern=f"%{category}:{record_id}%"
+    rows=db.scalars(select(AuditLog).where(AuditLog.resource.like(pattern)).order_by(AuditLog.id.desc()).limit(limit)).all()
+    return {"items":[{"id":row.id,"actor":row.actor,"action":row.action,"resource":row.resource,"method":row.http_method,"path":row.path,"status_code":row.status_code,"created_at":row.created_at} for row in rows],"limit":limit,"scope":"Filtered audit records for the anomaly category and ID; matching is resource-string based."}
+
+
+# Sprint 273-288: Unified governance findings registry. Findings are separate from task creation.
+class GovernanceFinding(Base):
+    __tablename__ = "governance_findings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(40), index=True)
+    source_ref: Mapped[str] = mapped_column(String(160), default="")
+    rule_code: Mapped[str] = mapped_column(String(100), default="", index=True)
+    title: Mapped[str] = mapped_column(String(240))
+    description: Mapped[str] = mapped_column(Text, default="")
+    severity: Mapped[str] = mapped_column(String(20), default="中")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    owner: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(30), default="待处理", index=True)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("governance_tasks.id", ondelete="SET NULL"), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+class GovernanceScanRun(Base):
+    __tablename__ = "governance_scan_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scan_code: Mapped[str] = mapped_column(String(40), unique=True)
+    scope_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(30), default="完成")
+    issues_created: Mapped[int] = mapped_column(Integer, default=0)
+    issues_updated: Mapped[int] = mapped_column(Integer, default=0)
+    issues_found: Mapped[int] = mapped_column(Integer, default=0)
+    started_by: Mapped[str] = mapped_column(String(120), default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+
+class FindingIn(BaseModel):
+    source_type: str = Field(min_length=2, max_length=40)
+    source_ref: str = Field(default="", max_length=160)
+    rule_code: str = Field(default="", max_length=100)
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(default="", max_length=4000)
+    severity: str = Field(default="中", pattern="^(低|中|高|严重)$")
+    owner_department: str = Field(default="", max_length=120)
+    owner: str = Field(default="", max_length=120)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+@app.get("/api/v1/governance/findings")
+def list_governance_findings(status:str|None=None, source_type:str|None=None, severity:str|None=None, rule_code:str|None=None, page:int=1, page_size:int=50, _user:User=Depends(require_permission("governance:read")), db:Session=Depends(db_session)):
+    if page<1 or page_size<1 or page_size>200: raise HTTPException(422,"分页参数无效")
+    stmt=select(GovernanceFinding)
+    if status: stmt=stmt.where(GovernanceFinding.status==status)
+    if source_type: stmt=stmt.where(GovernanceFinding.source_type==source_type)
+    if severity: stmt=stmt.where(GovernanceFinding.severity==severity)
+    if rule_code: stmt=stmt.where(GovernanceFinding.rule_code==rule_code)
+    total=db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows=db.scalars(stmt.order_by(GovernanceFinding.last_seen_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
+    def item(x):
+        try: ev=json.loads(x.evidence_json or "{}")
+        except (TypeError,json.JSONDecodeError): ev={}
+        return {"id":x.id,"fingerprint":x.fingerprint,"source_type":x.source_type,"source_ref":x.source_ref,"rule_code":x.rule_code,"title":x.title,"description":x.description,"severity":x.severity,"owner_department":x.owner_department,"owner":x.owner,"status":x.status,"evidence":ev,"task_id":x.task_id,"first_seen_at":x.first_seen_at,"last_seen_at":x.last_seen_at,"resolved_at":x.resolved_at}
+    return {"items":[item(x) for x in rows],"total":total,"page":page,"page_size":page_size}
+
+@app.post("/api/v1/governance/findings/register",status_code=201)
+def register_governance_finding(payload:FindingIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    canonical=json.dumps({"source_type":payload.source_type.strip(),"source_ref":payload.source_ref.strip(),"rule_code":payload.rule_code.strip(),"title":payload.title.strip()},sort_keys=True,separators=(",",":"))
+    fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(); now=datetime.utcnow()
+    row=db.scalar(select(GovernanceFinding).where(GovernanceFinding.fingerprint==fingerprint)); created=row is None
+    if row is None:
+        row=GovernanceFinding(fingerprint=fingerprint,source_type=payload.source_type.strip(),source_ref=payload.source_ref.strip(),rule_code=payload.rule_code.strip(),title=payload.title.strip(),description=payload.description.strip(),severity=payload.severity,owner_department=payload.owner_department.strip(),owner=payload.owner.strip(),evidence_json=json.dumps(payload.evidence,ensure_ascii=False),first_seen_at=now,last_seen_at=now)
+        db.add(row)
+    else:
+        row.last_seen_at=now
+        if row.status not in ("已关闭","已确认无问题"):
+            row.description=payload.description.strip();row.severity=payload.severity;row.evidence_json=json.dumps(payload.evidence,ensure_ascii=False)
+            if payload.owner: row.owner=payload.owner.strip()
+            if payload.owner_department: row.owner_department=payload.owner_department.strip()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE" if created else "UPDATE",resource=f"governance_finding:{fingerprint}",http_method="POST",path="/api/v1/governance/findings/register",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,"fingerprint":row.fingerprint,"created":created,"status":row.status,"last_seen_at":row.last_seen_at}
+
+@app.get("/api/v1/governance/findings/summary")
+def findings_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceFinding)).all(); by_status={}; by_severity={}; by_source={}
+    for x in rows:
+        for bucket,key in ((by_status,x.status),(by_severity,x.severity),(by_source,x.source_type)): bucket[key]=bucket.get(key,0)+1
+    return {"total":len(rows),"by_status":by_status,"by_severity":by_severity,"by_source":by_source}
+
+@app.get("/api/v1/governance/scan-runs")
+def list_governance_scan_runs(limit:int=50,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200: raise HTTPException(422,"limit超出范围")
+    rows=db.scalars(select(GovernanceScanRun).order_by(GovernanceScanRun.started_at.desc()).limit(limit)).all()
+    return {"items":[{"id":x.id,"scan_code":x.scan_code,"scope":json.loads(x.scope_json or "{}"),"status":x.status,"issues_created":x.issues_created,"issues_updated":x.issues_updated,"issues_found":x.issues_found,"started_by":x.started_by,"started_at":x.started_at,"finished_at":x.finished_at,"message":x.message} for x in rows],"limit":limit}
+
+class FindingStatusIn(BaseModel):
+    status: str = Field(pattern="^(待处理|处理中|待复核|已关闭|已确认无问题)$")
+    note: str = Field(default="", max_length=2000)
+
+@app.post("/api/v1/governance/findings/{finding_id}/status")
+def update_finding_status(finding_id:int,payload:FindingStatusIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    row=db.get(GovernanceFinding,finding_id)
+    if row is None: raise HTTPException(404,"治理问题不存在")
+    if payload.status in ("已关闭","已确认无问题"): row.resolved_at=datetime.utcnow()
+    else: row.resolved_at=None
+    row.status=payload.status
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",resource=f"governance_finding:{row.fingerprint}:status",http_method="POST",path=f"/api/v1/governance/findings/{finding_id}/status",status_code=200))
+    db.commit();db.refresh(row)
+    return {"id":row.id,"status":row.status,"resolved_at":row.resolved_at,"note":payload.note}
+
+@app.post("/api/v1/governance/findings/{finding_id}/create-task",status_code=201)
+def finding_create_task(finding_id:int,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    row=db.get(GovernanceFinding,finding_id)
+    if row is None: raise HTTPException(404,"治理问题不存在")
+    if row.task_id: raise HTTPException(409,"该问题已关联治理任务")
+    task=GovernanceTask(task_code=f"GOV-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}",title=row.title,task_type="治理整改",source_type=row.source_type,source_id=row.source_ref,description=row.description,owner=row.owner,owner_department=row.owner_department,created_by=user.username,status="待处理")
+    db.add(task);db.flush();row.task_id=task.id
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_finding:{row.fingerprint}:task:{task.id}",http_method="POST",path=f"/api/v1/governance/findings/{finding_id}/create-task",status_code=201))
+    db.commit();db.refresh(task)
+    return {"finding_id":row.id,"task_id":task.id,"task_code":task.task_code,"status":task.status}
+
+# Sprint 277-278: configurable governance rule catalog (templates; no arbitrary SQL)
+class GovernanceRuleCatalog(Base):
+    __tablename__ = "governance_rule_catalog"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_code: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(180))
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    template_key: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(Text, default="")
+    severity: Mapped[str] = mapped_column(String(20), default="中")
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class GovernanceRuleIn(BaseModel):
+    rule_code: str = Field(min_length=2, max_length=100)
+    name: str = Field(min_length=2, max_length=180)
+    category: str = Field(min_length=2, max_length=40)
+    template_key: str = Field(min_length=2, max_length=80)
+    description: str = Field(default="", max_length=4000)
+    severity: str = Field(default="中", pattern="^(低|中|高|严重)$")
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+@app.get("/api/v1/governance/rules")
+def list_governance_rules(category:str|None=None,enabled:bool|None=None,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    stmt=select(GovernanceRuleCatalog)
+    if category: stmt=stmt.where(GovernanceRuleCatalog.category==category)
+    if enabled is not None: stmt=stmt.where(GovernanceRuleCatalog.enabled==enabled)
+    rows=db.scalars(stmt.order_by(GovernanceRuleCatalog.category,GovernanceRuleCatalog.rule_code)).all()
+    return {"items":[{"id":x.id,"rule_code":x.rule_code,"name":x.name,"category":x.category,"template_key":x.template_key,"description":x.description,"severity":x.severity,"config":json.loads(x.config_json or "{}"),"version":x.version,"enabled":x.enabled,"updated_at":x.updated_at} for x in rows],"total":len(rows)}
+
+@app.post("/api/v1/governance/rules",status_code=201)
+def upsert_governance_rule(payload:GovernanceRuleIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    allowed_templates={"asset_required_field","classification_missing","standard_mapping_missing","metadata_staleness","quality_rule_coverage"}
+    if payload.template_key not in allowed_templates: raise HTTPException(422,"规则模板不在允许列表")
+    row=db.scalar(select(GovernanceRuleCatalog).where(GovernanceRuleCatalog.rule_code==payload.rule_code.strip()))
+    is_new=row is None
+    if row is None: row=GovernanceRuleCatalog(rule_code=payload.rule_code.strip(),name=payload.name.strip(),category=payload.category.strip(),template_key=payload.template_key,created_by=user.username)
+    else: row.version+=1
+    row.name=payload.name.strip();row.category=payload.category.strip();row.template_key=payload.template_key;row.description=payload.description.strip();row.severity=payload.severity;row.config_json=json.dumps(payload.config,ensure_ascii=False);row.enabled=payload.enabled;row.updated_at=datetime.utcnow()
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE" if is_new else "UPDATE",resource=f"governance_rule:{row.rule_code}:v{row.version}",http_method="POST",path="/api/v1/governance/rules",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,"rule_code":row.rule_code,"version":row.version,"enabled":row.enabled}
+
+
+# Sprint 279-281: safe, metadata-only governance rule executor and scan entry.
+_GOV_RULE_TEMPLATES = {"asset_required_field", "classification_missing", "standard_mapping_missing", "metadata_staleness", "quality_rule_coverage"}
+
+def _governance_scan_targets(db, scope: dict):
+    tables_stmt = select(MetadataTable)
+    source_id = scope.get("source_id")
+    table_ids = scope.get("table_ids")
+    if source_id is not None:
+        if not isinstance(source_id, int): raise HTTPException(422, "source_id 必须为整数")
+        tables_stmt = tables_stmt.where(MetadataTable.source_id == source_id)
+    if table_ids is not None:
+        if not isinstance(table_ids, list) or not table_ids or len(table_ids) > 500 or any(not isinstance(x,int) for x in table_ids):
+            raise HTTPException(422, "table_ids 必须是 1-500 个整数的列表")
+        tables_stmt = tables_stmt.where(MetadataTable.id.in_(table_ids))
+    return db.scalars(tables_stmt.order_by(MetadataTable.id)).all()
+
+def _execute_governance_template(db, rule, tables):
+    try: config = json.loads(rule.config_json or "{}")
+    except (TypeError, json.JSONDecodeError): raise ValueError("规则配置JSON格式错误")
+    findings=[]
+    for table in tables:
+        columns=db.scalars(select(MetadataColumn).where(MetadataColumn.table_id==table.id).order_by(MetadataColumn.ordinal_position)).all()
+        asset=db.scalar(select(DataAsset).where(DataAsset.metadata_table_id==table.id))
+        ref=f"{table.schema_name}.{table.table_name}".strip(".")
+        base={"table_id":table.id,"source_id":table.source_id,"schema":table.schema_name,"table":table.table_name}
+        key=rule.template_key
+        if key=="asset_required_field":
+            required=config.get("fields",["description","owner","owner_department"])
+            if not isinstance(required,list) or any(x not in {"description","owner","owner_department","business_domain"} for x in required): raise ValueError("asset_required_field.fields 配置无效")
+            absent=[x for x in required if not asset or not str(getattr(asset,x,None) or "").strip()]
+            if absent: findings.append((ref,"资产信息缺失",f"资产信息未填写字段：{', '.join(absent)}",{**base,"missing_fields":absent}))
+        elif key=="classification_missing":
+            target=config.get("scope","columns")
+            if target not in ("columns","tables"): raise ValueError("classification_missing.scope 配置无效")
+            if target=="tables":
+                if not asset or asset.sensitivity_level in (None,"","未分级"): findings.append((ref,"数据表未分类分级","关联资产尚未完成分类分级",{**base,"scope":"tables"}))
+            else:
+                missing=[c.column_name for c in columns if c.sensitivity_level in (None,"","未分级")]
+                if missing: findings.append((ref,"字段分类分级缺失",f"{len(missing)} 个字段未分级",{**base,"missing_columns":missing[:100],"count":len(missing)}))
+        elif key=="standard_mapping_missing":
+            ids=[c.id for c in columns]
+            if ids:
+                mapped=set(db.scalars(select(DataStandardMapping.metadata_column_id).where(DataStandardMapping.metadata_column_id.in_(ids),DataStandardMapping.mapping_status=="已落标")).all())
+                missing=[c.column_name for c in columns if c.id not in mapped]
+                if missing: findings.append((ref,"数据标准映射覆盖不足",f"{len(missing)} 个字段缺少已确认标准映射",{**base,"missing_columns":missing[:100],"count":len(missing)}))
+        elif key=="metadata_staleness":
+            days=config.get("days",30)
+            if not isinstance(days,int) or days<1 or days>3650: raise ValueError("metadata_staleness.days 必须为1-3650")
+            age=(datetime.utcnow()-table.synced_at).days if table.synced_at else days+1
+            if age>=days: findings.append((ref,"元数据同步过期",f"元数据已 {age} 天未同步，阈值为 {days} 天",{**base,"age_days":age,"threshold_days":days}))
+        elif key=="quality_rule_coverage":
+            if columns:
+                covered=db.scalar(select(func.count(QualityRule.id)).where(QualityRule.metadata_table_id==table.id)) or 0
+                if covered==0: findings.append((ref,"缺少数据质量规则","该表未配置数据质量规则",{**base,"quality_rule_count":covered}))
+        else: raise ValueError(f"不支持的模板：{key}")
+    return findings
+
+@app.post("/api/v1/governance/scans/run",status_code=202)
+def run_governance_scan(payload:dict,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    scope=payload.get("scope",{})
+    rule_ids=payload.get("rule_ids")
+    if not isinstance(scope,dict) or len(json.dumps(scope))>4000: raise HTTPException(422,"scope无效")
+    if rule_ids is not None and (not isinstance(rule_ids,list) or not rule_ids or len(rule_ids)>100 or any(not isinstance(x,int) for x in rule_ids)):
+        raise HTTPException(422,"rule_ids必须为1-100个整数")
+    rules_stmt=select(GovernanceRuleCatalog).where(GovernanceRuleCatalog.enabled==True)
+    if rule_ids: rules_stmt=rules_stmt.where(GovernanceRuleCatalog.id.in_(rule_ids))
+    rules=db.scalars(rules_stmt.order_by(GovernanceRuleCatalog.id)).all()
+    if not rules: raise HTTPException(422,"没有可执行的启用规则")
+    unsupported=[r.rule_code for r in rules if r.template_key not in _GOV_RULE_TEMPLATES]
+    if unsupported: raise HTTPException(422,f"包含不支持模板的规则：{unsupported}")
+    tables=_governance_scan_targets(db,scope)
+    code=f"SCAN-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}"
+    run=GovernanceScanRun(scan_code=code,scope_json=json.dumps(scope,ensure_ascii=False),status="运行中",started_by=user.username,started_at=datetime.utcnow())
+    db.add(run);db.flush()
+    created=updated=found=0; errors=[]
+    for rule in rules:
+        try:
+            results=_execute_governance_template(db,rule,tables)
+            for source_ref,title,description,evidence in results:
+                found+=1
+                canonical=json.dumps({"source_type":"metadata_table","source_ref":source_ref,"rule_code":rule.rule_code,"title":title},sort_keys=True,separators=(",",":"))
+                fp=hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                row=db.scalar(select(GovernanceFinding).where(GovernanceFinding.fingerprint==fp));now=datetime.utcnow()
+                if row is None:
+                    row=GovernanceFinding(fingerprint=fp,source_type="metadata_table",source_ref=source_ref,rule_code=rule.rule_code,title=title,description=description,severity=rule.severity,evidence_json=json.dumps(evidence,ensure_ascii=False),first_seen_at=now,last_seen_at=now)
+                    db.add(row);created+=1
+                else:
+                    row.last_seen_at=now
+                    if row.status not in ("已关闭","已确认无问题"):
+                        row.description=description;row.severity=rule.severity;row.evidence_json=json.dumps(evidence,ensure_ascii=False);updated+=1
+        except Exception as exc:
+            errors.append({"rule_code":rule.rule_code,"error":str(exc)[:500]})
+    run.issues_created=created;run.issues_updated=updated;run.issues_found=found;run.finished_at=datetime.utcnow()
+    run.status="部分失败" if errors else "完成"
+    run.message=json.dumps({"rules":len(rules),"tables":len(tables),"errors":errors},ensure_ascii=False)
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="EXECUTE",resource=f"governance_scan:{code}",http_method="POST",path="/api/v1/governance/scans/run",status_code=202))
+    db.commit();db.refresh(run)
+    return {"scan_code":run.scan_code,"status":run.status,"rules_count":len(rules),"tables_count":len(tables),"issues_found":found,"issues_created":created,"issues_updated":updated,"errors":errors}
