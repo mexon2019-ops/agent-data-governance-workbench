@@ -3242,7 +3242,7 @@ def _execute_governance_template(db, rule, tables):
         if key=="asset_required_field":
             required=config.get("fields",["description","owner","owner_department"])
             if not isinstance(required,list) or any(x not in {"description","owner","owner_department","business_domain"} for x in required): raise ValueError("asset_required_field.fields 配置无效")
-            absent=[x for x in required if not asset or not str(getattr(asset,x,"",None) or "").strip()]
+            absent=[x for x in required if not asset or not str(getattr(asset,x,None) or "").strip()]
             if absent: findings.append((ref,"资产信息缺失",f"资产信息未填写字段：{', '.join(absent)}",{**base,"missing_fields":absent}))
         elif key=="classification_missing":
             target=config.get("scope","columns")
