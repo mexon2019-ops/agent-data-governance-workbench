@@ -3165,3 +3165,49 @@ def finding_create_task(finding_id:int,user:User=Depends(require_permission("gov
     db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_finding:{row.fingerprint}:task:{task.id}",http_method="POST",path=f"/api/v1/governance/findings/{finding_id}/create-task",status_code=201))
     db.commit();db.refresh(task)
     return {"finding_id":row.id,"task_id":task.id,"task_code":task.task_code,"status":task.status}
+
+# Sprint 277-278: configurable governance rule catalog (templates; no arbitrary SQL)
+class GovernanceRuleCatalog(Base):
+    __tablename__ = "governance_rule_catalog"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_code: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(180))
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    template_key: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(Text, default="")
+    severity: Mapped[str] = mapped_column(String(20), default="中")
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class GovernanceRuleIn(BaseModel):
+    rule_code: str = Field(min_length=2, max_length=100)
+    name: str = Field(min_length=2, max_length=180)
+    category: str = Field(min_length=2, max_length=40)
+    template_key: str = Field(min_length=2, max_length=80)
+    description: str = Field(default="", max_length=4000)
+    severity: str = Field(default="中", pattern="^(低|中|高|严重)$")
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+@app.get("/api/v1/governance/rules")
+def list_governance_rules(category:str|None=None,enabled:bool|None=None,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    stmt=select(GovernanceRuleCatalog)
+    if category: stmt=stmt.where(GovernanceRuleCatalog.category==category)
+    if enabled is not None: stmt=stmt.where(GovernanceRuleCatalog.enabled==enabled)
+    rows=db.scalars(stmt.order_by(GovernanceRuleCatalog.category,GovernanceRuleCatalog.rule_code)).all()
+    return {"items":[{"id":x.id,"rule_code":x.rule_code,"name":x.name,"category":x.category,"template_key":x.template_key,"description":x.description,"severity":x.severity,"config":json.loads(x.config_json or "{}"),"version":x.version,"enabled":x.enabled,"updated_at":x.updated_at} for x in rows],"total":len(rows)}
+
+@app.post("/api/v1/governance/rules",status_code=201)
+def upsert_governance_rule(payload:GovernanceRuleIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    allowed_templates={"asset_required_field","classification_missing","standard_mapping_missing","metadata_staleness","quality_rule_coverage"}
+    if payload.template_key not in allowed_templates: raise HTTPException(422,"规则模板不在允许列表")
+    row=db.scalar(select(GovernanceRuleCatalog).where(GovernanceRuleCatalog.rule_code==payload.rule_code.strip()))
+    is_new=row is None
+    if row is None: row=GovernanceRuleCatalog(rule_code=payload.rule_code.strip(),name=payload.name.strip(),category=payload.category.strip(),template_key=payload.template_key,created_by=user.username)
+    else: row.version+=1
+    row.name=payload.name.strip();row.category=payload.category.strip();row.template_key=payload.template_key;row.description=payload.description.strip();row.severity=payload.severity;row.config_json=json.dumps(payload.config,ensure_ascii=False);row.enabled=payload.enabled;row.updated_at=datetime.utcnow()
+    db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE" if is_new else "UPDATE",resource=f"governance_rule:{row.rule_code}:v{row.version}",http_method="POST",path="/api/v1/governance/rules",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,"rule_code":row.rule_code,"version":row.version,"enabled":row.enabled}
