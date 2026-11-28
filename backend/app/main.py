@@ -3211,3 +3211,103 @@ def upsert_governance_rule(payload:GovernanceRuleIn,user:User=Depends(require_pe
     row.name=payload.name.strip();row.category=payload.category.strip();row.template_key=payload.template_key;row.description=payload.description.strip();row.severity=payload.severity;row.config_json=json.dumps(payload.config,ensure_ascii=False);row.enabled=payload.enabled;row.updated_at=datetime.utcnow()
     db.add(row);db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE" if is_new else "UPDATE",resource=f"governance_rule:{row.rule_code}:v{row.version}",http_method="POST",path="/api/v1/governance/rules",status_code=201));db.commit();db.refresh(row)
     return {"id":row.id,"rule_code":row.rule_code,"version":row.version,"enabled":row.enabled}
+
+
+# Sprint 279-281: safe, metadata-only governance rule executor and scan entry.
+_GOV_RULE_TEMPLATES = {"asset_required_field", "classification_missing", "standard_mapping_missing", "metadata_staleness", "quality_rule_coverage"}
+
+def _governance_scan_targets(db, scope: dict):
+    tables_stmt = select(MetadataTable)
+    source_id = scope.get("source_id")
+    table_ids = scope.get("table_ids")
+    if source_id is not None:
+        if not isinstance(source_id, int): raise HTTPException(422, "source_id 必须为整数")
+        tables_stmt = tables_stmt.where(MetadataTable.source_id == source_id)
+    if table_ids is not None:
+        if not isinstance(table_ids, list) or not table_ids or len(table_ids) > 500 or any(not isinstance(x,int) for x in table_ids):
+            raise HTTPException(422, "table_ids 必须是 1-500 个整数的列表")
+        tables_stmt = tables_stmt.where(MetadataTable.id.in_(table_ids))
+    return db.scalars(tables_stmt.order_by(MetadataTable.id)).all()
+
+def _execute_governance_template(db, rule, tables):
+    try: config = json.loads(rule.config_json or "{}")
+    except (TypeError, json.JSONDecodeError): raise ValueError("规则配置JSON格式错误")
+    findings=[]
+    for table in tables:
+        columns=db.scalars(select(MetadataColumn).where(MetadataColumn.table_id==table.id).order_by(MetadataColumn.ordinal_position)).all()
+        asset=db.scalar(select(DataAsset).where(DataAsset.metadata_table_id==table.id))
+        ref=f"{table.schema_name}.{table.table_name}".strip(".")
+        base={"table_id":table.id,"source_id":table.source_id,"schema":table.schema_name,"table":table.table_name}
+        key=rule.template_key
+        if key=="asset_required_field":
+            required=config.get("fields",["description","owner","owner_department"])
+            if not isinstance(required,list) or any(x not in {"description","owner","owner_department","business_domain"} for x in required): raise ValueError("asset_required_field.fields 配置无效")
+            absent=[x for x in required if not asset or not str(getattr(asset,x,"",None) or "").strip()]
+            if absent: findings.append((ref,"资产信息缺失",f"资产信息未填写字段：{', '.join(absent)}",{**base,"missing_fields":absent}))
+        elif key=="classification_missing":
+            target=config.get("scope","columns")
+            if target not in ("columns","tables"): raise ValueError("classification_missing.scope 配置无效")
+            if target=="tables":
+                if not asset or asset.sensitivity_level in (None,"","未分级"): findings.append((ref,"数据表未分类分级","关联资产尚未完成分类分级",{**base,"scope":"tables"}))
+            else:
+                missing=[c.column_name for c in columns if c.sensitivity_level in (None,"","未分级")]
+                if missing: findings.append((ref,"字段分类分级缺失",f"{len(missing)} 个字段未分级",{**base,"missing_columns":missing[:100],"count":len(missing)}))
+        elif key=="standard_mapping_missing":
+            ids=[c.id for c in columns]
+            if ids:
+                mapped=set(db.scalars(select(DataStandardMapping.metadata_column_id).where(DataStandardMapping.metadata_column_id.in_(ids),DataStandardMapping.mapping_status=="已落标")).all())
+                missing=[c.column_name for c in columns if c.id not in mapped]
+                if missing: findings.append((ref,"数据标准映射覆盖不足",f"{len(missing)} 个字段缺少已确认标准映射",{**base,"missing_columns":missing[:100],"count":len(missing)}))
+        elif key=="metadata_staleness":
+            days=config.get("days",30)
+            if not isinstance(days,int) or days<1 or days>3650: raise ValueError("metadata_staleness.days 必须为1-3650")
+            age=(datetime.utcnow()-table.synced_at).days if table.synced_at else days+1
+            if age>=days: findings.append((ref,"元数据同步过期",f"元数据已 {age} 天未同步，阈值为 {days} 天",{**base,"age_days":age,"threshold_days":days}))
+        elif key=="quality_rule_coverage":
+            if columns:
+                covered=db.scalar(select(func.count(QualityRule.id)).where(QualityRule.metadata_table_id==table.id)) or 0
+                if covered==0: findings.append((ref,"缺少数据质量规则","该表未配置数据质量规则",{**base,"quality_rule_count":covered}))
+        else: raise ValueError(f"不支持的模板：{key}")
+    return findings
+
+@app.post("/api/v1/governance/scans/run",status_code=202)
+def run_governance_scan(payload:dict,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    scope=payload.get("scope",{})
+    rule_ids=payload.get("rule_ids")
+    if not isinstance(scope,dict) or len(json.dumps(scope))>4000: raise HTTPException(422,"scope无效")
+    if rule_ids is not None and (not isinstance(rule_ids,list) or not rule_ids or len(rule_ids)>100 or any(not isinstance(x,int) for x in rule_ids)):
+        raise HTTPException(422,"rule_ids必须为1-100个整数")
+    rules_stmt=select(GovernanceRuleCatalog).where(GovernanceRuleCatalog.enabled==True)
+    if rule_ids: rules_stmt=rules_stmt.where(GovernanceRuleCatalog.id.in_(rule_ids))
+    rules=db.scalars(rules_stmt.order_by(GovernanceRuleCatalog.id)).all()
+    if not rules: raise HTTPException(422,"没有可执行的启用规则")
+    unsupported=[r.rule_code for r in rules if r.template_key not in _GOV_RULE_TEMPLATES]
+    if unsupported: raise HTTPException(422,f"包含不支持模板的规则：{unsupported}")
+    tables=_governance_scan_targets(db,scope)
+    code=f"SCAN-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}"
+    run=GovernanceScanRun(scan_code=code,scope_json=json.dumps(scope,ensure_ascii=False),status="运行中",started_by=user.username,started_at=datetime.utcnow())
+    db.add(run);db.flush()
+    created=updated=found=0; errors=[]
+    for rule in rules:
+        try:
+            results=_execute_governance_template(db,rule,tables)
+            for source_ref,title,description,evidence in results:
+                found+=1
+                canonical=json.dumps({"source_type":"metadata_table","source_ref":source_ref,"rule_code":rule.rule_code,"title":title},sort_keys=True,separators=(",",":"))
+                fp=hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                row=db.scalar(select(GovernanceFinding).where(GovernanceFinding.fingerprint==fp));now=datetime.utcnow()
+                if row is None:
+                    row=GovernanceFinding(fingerprint=fp,source_type="metadata_table",source_ref=source_ref,rule_code=rule.rule_code,title=title,description=description,severity=rule.severity,evidence_json=json.dumps(evidence,ensure_ascii=False),first_seen_at=now,last_seen_at=now)
+                    db.add(row);created+=1
+                else:
+                    row.last_seen_at=now
+                    if row.status not in ("已关闭","已确认无问题"):
+                        row.description=description;row.severity=rule.severity;row.evidence_json=json.dumps(evidence,ensure_ascii=False);updated+=1
+        except Exception as exc:
+            errors.append({"rule_code":rule.rule_code,"error":str(exc)[:500]})
+    run.issues_created=created;run.issues_updated=updated;run.issues_found=found;run.finished_at=datetime.utcnow()
+    run.status="部分失败" if errors else "完成"
+    run.message=json.dumps({"rules":len(rules),"tables":len(tables),"errors":errors},ensure_ascii=False)
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="EXECUTE",resource=f"governance_scan:{code}",http_method="POST",path="/api/v1/governance/scans/run",status_code=202))
+    db.commit();db.refresh(run)
+    return {"scan_code":run.scan_code,"status":run.status,"rules_count":len(rules),"tables_count":len(tables),"issues_found":found,"issues_created":created,"issues_updated":updated,"errors":errors}
