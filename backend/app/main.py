@@ -3047,3 +3047,95 @@ def integrity_action_audit(category:str,record_id:int,limit:int=50,_user:User=De
     resource=f"review_integrity:{category}:{record_id}"; pattern=f"%{category}:{record_id}%"
     rows=db.scalars(select(AuditLog).where(AuditLog.resource.like(pattern)).order_by(AuditLog.id.desc()).limit(limit)).all()
     return {"items":[{"id":row.id,"actor":row.actor,"action":row.action,"resource":row.resource,"method":row.http_method,"path":row.path,"status_code":row.status_code,"created_at":row.created_at} for row in rows],"limit":limit,"scope":"Filtered audit records for the anomaly category and ID; matching is resource-string based."}
+
+
+# Sprint 273-288: Unified governance findings registry. Findings are separate from task creation.
+class GovernanceFinding(Base):
+    __tablename__ = "governance_findings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(40), index=True)
+    source_ref: Mapped[str] = mapped_column(String(160), default="")
+    rule_code: Mapped[str] = mapped_column(String(100), default="", index=True)
+    title: Mapped[str] = mapped_column(String(240))
+    description: Mapped[str] = mapped_column(Text, default="")
+    severity: Mapped[str] = mapped_column(String(20), default="中")
+    owner_department: Mapped[str] = mapped_column(String(120), default="")
+    owner: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(30), default="待处理", index=True)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("governance_tasks.id", ondelete="SET NULL"), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+class GovernanceScanRun(Base):
+    __tablename__ = "governance_scan_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scan_code: Mapped[str] = mapped_column(String(40), unique=True)
+    scope_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(30), default="完成")
+    issues_created: Mapped[int] = mapped_column(Integer, default=0)
+    issues_updated: Mapped[int] = mapped_column(Integer, default=0)
+    issues_found: Mapped[int] = mapped_column(Integer, default=0)
+    started_by: Mapped[str] = mapped_column(String(120), default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+
+class FindingIn(BaseModel):
+    source_type: str = Field(min_length=2, max_length=40)
+    source_ref: str = Field(default="", max_length=160)
+    rule_code: str = Field(default="", max_length=100)
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(default="", max_length=4000)
+    severity: str = Field(default="中", pattern="^(低|中|高|严重)$")
+    owner_department: str = Field(default="", max_length=120)
+    owner: str = Field(default="", max_length=120)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+@app.get("/api/v1/governance/findings")
+def list_governance_findings(status:str|None=None, source_type:str|None=None, severity:str|None=None, rule_code:str|None=None, page:int=1, page_size:int=50, _user:User=Depends(require_permission("governance:read")), db:Session=Depends(db_session)):
+    if page<1 or page_size<1 or page_size>200: raise HTTPException(422,"分页参数无效")
+    stmt=select(GovernanceFinding)
+    if status: stmt=stmt.where(GovernanceFinding.status==status)
+    if source_type: stmt=stmt.where(GovernanceFinding.source_type==source_type)
+    if severity: stmt=stmt.where(GovernanceFinding.severity==severity)
+    if rule_code: stmt=stmt.where(GovernanceFinding.rule_code==rule_code)
+    total=db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows=db.scalars(stmt.order_by(GovernanceFinding.last_seen_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
+    def item(x):
+        try: ev=json.loads(x.evidence_json or "{}")
+        except (TypeError,json.JSONDecodeError): ev={}
+        return {"id":x.id,"fingerprint":x.fingerprint,"source_type":x.source_type,"source_ref":x.source_ref,"rule_code":x.rule_code,"title":x.title,"description":x.description,"severity":x.severity,"owner_department":x.owner_department,"owner":x.owner,"status":x.status,"evidence":ev,"task_id":x.task_id,"first_seen_at":x.first_seen_at,"last_seen_at":x.last_seen_at,"resolved_at":x.resolved_at}
+    return {"items":[item(x) for x in rows],"total":total,"page":page,"page_size":page_size}
+
+@app.post("/api/v1/governance/findings/register",status_code=201)
+def register_governance_finding(payload:FindingIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    canonical=json.dumps({"source_type":payload.source_type.strip(),"source_ref":payload.source_ref.strip(),"rule_code":payload.rule_code.strip(),"title":payload.title.strip()},sort_keys=True,separators=(",",":"))
+    fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(); now=datetime.utcnow()
+    row=db.scalar(select(GovernanceFinding).where(GovernanceFinding.fingerprint==fingerprint)); created=row is None
+    if row is None:
+        row=GovernanceFinding(fingerprint=fingerprint,source_type=payload.source_type.strip(),source_ref=payload.source_ref.strip(),rule_code=payload.rule_code.strip(),title=payload.title.strip(),description=payload.description.strip(),severity=payload.severity,owner_department=payload.owner_department.strip(),owner=payload.owner.strip(),evidence_json=json.dumps(payload.evidence,ensure_ascii=False),first_seen_at=now,last_seen_at=now)
+        db.add(row)
+    else:
+        row.last_seen_at=now
+        if row.status not in ("已关闭","已确认无问题"):
+            row.description=payload.description.strip();row.severity=payload.severity;row.evidence_json=json.dumps(payload.evidence,ensure_ascii=False)
+            if payload.owner: row.owner=payload.owner.strip()
+            if payload.owner_department: row.owner_department=payload.owner_department.strip()
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE" if created else "UPDATE",resource=f"governance_finding:{fingerprint}",http_method="POST",path="/api/v1/governance/findings/register",status_code=201));db.commit();db.refresh(row)
+    return {"id":row.id,"fingerprint":row.fingerprint,"created":created,"status":row.status,"last_seen_at":row.last_seen_at}
+
+@app.get("/api/v1/governance/findings/summary")
+def findings_summary(_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    rows=db.scalars(select(GovernanceFinding)).all(); by_status={}; by_severity={}; by_source={}
+    for x in rows:
+        for bucket,key in ((by_status,x.status),(by_severity,x.severity),(by_source,x.source_type)): bucket[key]=bucket.get(key,0)+1
+    return {"total":len(rows),"by_status":by_status,"by_severity":by_severity,"by_source":by_source}
+
+@app.get("/api/v1/governance/scan-runs")
+def list_governance_scan_runs(limit:int=50,_user:User=Depends(require_permission("governance:read")),db:Session=Depends(db_session)):
+    if limit<1 or limit>200: raise HTTPException(422,"limit超出范围")
+    rows=db.scalars(select(GovernanceScanRun).order_by(GovernanceScanRun.started_at.desc()).limit(limit)).all()
+    return {"items":[{"id":x.id,"scan_code":x.scan_code,"scope":json.loads(x.scope_json or "{}"),"status":x.status,"issues_created":x.issues_created,"issues_updated":x.issues_updated,"issues_found":x.issues_found,"started_by":x.started_by,"started_at":x.started_at,"finished_at":x.finished_at,"message":x.message} for x in rows],"limit":limit}
