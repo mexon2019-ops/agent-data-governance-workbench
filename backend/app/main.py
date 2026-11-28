@@ -3139,3 +3139,29 @@ def list_governance_scan_runs(limit:int=50,_user:User=Depends(require_permission
     if limit<1 or limit>200: raise HTTPException(422,"limit超出范围")
     rows=db.scalars(select(GovernanceScanRun).order_by(GovernanceScanRun.started_at.desc()).limit(limit)).all()
     return {"items":[{"id":x.id,"scan_code":x.scan_code,"scope":json.loads(x.scope_json or "{}"),"status":x.status,"issues_created":x.issues_created,"issues_updated":x.issues_updated,"issues_found":x.issues_found,"started_by":x.started_by,"started_at":x.started_at,"finished_at":x.finished_at,"message":x.message} for x in rows],"limit":limit}
+
+class FindingStatusIn(BaseModel):
+    status: str = Field(pattern="^(待处理|处理中|待复核|已关闭|已确认无问题)$")
+    note: str = Field(default="", max_length=2000)
+
+@app.post("/api/v1/governance/findings/{finding_id}/status")
+def update_finding_status(finding_id:int,payload:FindingStatusIn,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    row=db.get(GovernanceFinding,finding_id)
+    if row is None: raise HTTPException(404,"治理问题不存在")
+    if payload.status in ("已关闭","已确认无问题"): row.resolved_at=datetime.utcnow()
+    else: row.resolved_at=None
+    row.status=payload.status
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="UPDATE",resource=f"governance_finding:{row.fingerprint}:status",http_method="POST",path=f"/api/v1/governance/findings/{finding_id}/status",status_code=200))
+    db.commit();db.refresh(row)
+    return {"id":row.id,"status":row.status,"resolved_at":row.resolved_at,"note":payload.note}
+
+@app.post("/api/v1/governance/findings/{finding_id}/create-task",status_code=201)
+def finding_create_task(finding_id:int,user:User=Depends(require_permission("governance:write")),db:Session=Depends(db_session)):
+    row=db.get(GovernanceFinding,finding_id)
+    if row is None: raise HTTPException(404,"治理问题不存在")
+    if row.task_id: raise HTTPException(409,"该问题已关联治理任务")
+    task=GovernanceTask(task_code=f"GOV-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}",title=row.title,task_type="治理整改",source_type=row.source_type,source_id=row.source_ref,description=row.description,owner=row.owner,owner_department=row.owner_department,created_by=user.username,status="待处理")
+    db.add(task);db.flush();row.task_id=task.id
+    db.add(AuditLog(request_id=str(uuid4()),actor=user.username,action="CREATE",resource=f"governance_finding:{row.fingerprint}:task:{task.id}",http_method="POST",path=f"/api/v1/governance/findings/{finding_id}/create-task",status_code=201))
+    db.commit();db.refresh(task)
+    return {"finding_id":row.id,"task_id":task.id,"task_code":task.task_code,"status":task.status}
